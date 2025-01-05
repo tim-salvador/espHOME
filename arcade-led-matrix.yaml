@@ -1,0 +1,259 @@
+## mosquitto_pub -h mqtthost -t text/text -m "Hi there!"
+#mqtt:
+#  id: mqtt_client
+#  broker: 192.168.1.50
+#  username: "****" 
+#  password: "****"
+
+#text_sensor:
+#  - platform: mqtt_subscribe
+#    name: "Text4"
+#    id: extratext
+#    topic: text/text4
+
+substitutions:
+#  devicename: esp32-03
+  xscrollpadding: "4" # in pix
+
+esphome:
+  name: led-matrix
+  friendly_name: led_matrix
+
+esp8266:
+  board: esp01_1m
+
+# Enable logging
+logger:
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret arcade_led_matrix_enc_key
+
+web_server:
+  port: 80
+
+ota:
+  password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  use_address: !secret led_matrix_address
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Esp8266 Fallback Hotspot"
+    password: !secret ap_fb_password
+
+captive_portal:
+
+
+########## Setup #######################
+wled:
+
+switch:
+  - platform: gpio
+    pin: GPIO13
+    name: "LED Matrix Flash"
+    id: led_matrix_flash
+    internal: true
+    restore_mode: ALWAYS_OFF
+
+  - platform: gpio
+    name: "Relay"
+    pin:
+      number: GPIO5
+      inverted: True
+  
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO3
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    name: "LED Matrix Confirm"
+    id: led_matrix_confirm
+    internal: true
+    on_press:
+      then:
+        - script.execute: stop
+
+time:
+  - platform: sntp
+    id: esptime
+
+image:
+# https://pictogrammers.com/library/mdi/
+#  - file: mdi:one-up
+#    id: mdi1up
+#    resize: 16x16
+  - file: mdi:ghost
+    id: mdighost
+    resize: 16x16
+  - file: img/genesis.png
+    id: pngfile
+    resize: 64x20
+
+animation:
+  - file: img/genesis.png
+    id: boo
+    resize: 64x20
+
+script:
+  - id: start
+    mode: restart
+    then:
+      - switch.turn_on: led_matrix_flash
+      - delay: 60s
+      - script.execute: stop
+  - id: stop
+    then:
+      - script.stop: start
+      - switch.turn_off: led_matrix_flash
+      - homeassistant.service:
+          service: input_text.set_value
+          data:
+            value: ""
+            entity_id: input_text.led_matrix_text
+
+text_sensor:
+  - platform: homeassistant
+    name: "Matrix Text"
+    entity_id: input_text.led_matrix_text
+    id: led_matrix_text
+    internal: true
+    on_value:
+      - if:
+          condition:
+            text_sensor.state:
+              id: led_matrix_text
+              state: ""
+          else:
+            - script.execute: start
+
+  - platform: homeassistant
+    name: "Weather Forecast From Home Assistant"
+    entity_id: sensor.weather_forecast
+
+font:
+  - id: tinyfont
+    file: "ttf/lexis.ttf"
+    size: 8
+    glyphs: '''äöüß!"%()+,-_.:*=°?~#0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ abcdefghijklmnopqrstuvwxyz'
+
+color:
+  - id: red
+    red: 100%
+    green: 0%
+    blue: 0%
+  - id: green
+    red: 0%
+    green: 100%
+    blue: 0%
+  - id: blue
+    red: 0%
+    green: 0%
+    blue: 100%
+  - id: yellow
+    red: 100%
+    green: 100%
+    blue: 0%
+  - id: black
+    red: 0%
+    green: 0%
+    blue: 0%    
+
+light:
+  - platform: neopixelbus
+    variant: WS2812
+    pin: GPIO2
+    num_leds: 1024
+    type: GRB
+    name: "led_matrix"
+    id: led_matrix_light
+    on_turn_on:
+      - logger.log: "Light Turned On!"
+      - light.control:
+          id: led_matrix_light
+          brightness: 25%
+      - switch.turn_on: led_matrix_flash
+    default_transition_length: 0s
+    color_correct: [50%, 50%, 50%]
+    internal: true
+    restore_mode: ALWAYS_ON
+    effects:
+      - wled:
+  
+display:
+  - platform: addressable_light
+    id: led_matrix_display
+    addressable_light_id: led_matrix_light
+   
+    width: 64
+    height: 16
+    pixel_mapper: |-
+      int iMatrixOffset = y >= 8 ? 512 : 0;
+      if (x % 2 == 0) {
+        return (x * 8) + (y % 8) + iMatrixOffset;
+      }
+      return (x * 8) + iMatrixOffset + (7 - (y % 8));
+
+    rotation: 0°
+    update_interval: 200ms
+    lambda: |-
+
+          // Draw the image my_image at position [x=0,y=0]
+          it.image(0, 0, id(pngfile), id(red), id(blue));
+          //it.image(17, 0, id(favicon));
+
+          //// Ingress shown animation Frame.
+          //id(boo).next_frame();
+          //// Draw the animation my_animation at position [x=0,y=0]
+          //it.image(0, 0, id(boo), COLOR_OFF, COLOR_ON);
+
+          static int16_t xpos = it.get_width();
+          const char * text = id(led_matrix_text).state.c_str();
+ 
+          auto color = Color(0, 0, 255);
+          int x_start, y_start;
+          int width, height;
+ 
+          it.get_text_bounds(
+            0, 0, text, id(tinyfont), 
+            TextAlign::TOP_LEFT,
+            &x_start, &y_start, &width, &height
+          ); 
+
+          // Print "Hello" in top center.
+          //it.printf(2, 9, id(tinyfont), TextAlign::TOP_LEFT, "Hello");
+
+          // Draw a line from [0,0] to [100,50]
+          ////it.line(0, 16, 32, 9);
+          // Draw the outline of a rectangle with the top left at [50,60], a width of 30 and a height of 42
+          //it.rectangle(50, 60, 30, 42);
+          // Draw the same rectangle, but this time filled.
+          //it.filled_rectangle(50, 60, 30, 42);
+
+          // Print time in HH:MM format
+          it.strftime(32, 1, id(tinyfont), TextAlign::TOP_LEFT, "%H:%M", id(esptime).now());
+
+          if(xpos < -1 * (width + $xscrollpadding)) {
+            xpos = it.get_width();
+          }
+ 
+          if(width <= it.get_width()) {
+            xpos = 17;
+          }
+ 
+          it.print(
+            xpos,
+            8, 
+            id(tinyfont),
+            color, 
+            TextAlign::TOP_LEFT,
+            text
+          ); 
+          xpos--;

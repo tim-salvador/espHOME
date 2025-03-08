@@ -1,0 +1,11 @@
+output:
+  - platform: gpio
+    id: bedroom_relay
+    pin: GPIO13    # GPIO13 - bedroom light relay
+    inverted: True
+      
+
+  - platform: gpio
+    id: closet_relay
+    pin: GPIO12    # GPIO12 - closet light relay
+    inverted: True

@@ -1,0 +1,74 @@
+binary_sensor:
+  - platform: gpio
+    id: bedroom_button
+    pin:
+      number: GPIO2
+      #mode: INPUT
+      mode: INPUT_PULLUP
+      inverted: True
+    on_multi_click:
+    - timing:
+        - ON for at most 1s
+        - OFF for at most 0.3s
+        - ON for at most 1s
+        - OFF for at least 0.2s
+      then:
+      - logger.log: "Double Clicked"
+      - homeassistant.service:
+            service: scene.turn_on
+            data_template:
+                entity_id: scene.bedroom_blind_open
+    - timing:
+        - ON for 1s to 2s
+        - OFF for at least 0.2s
+      then:
+      - logger.log: "Single Long Clicked"
+      - homeassistant.service:
+            service: cover.toggle
+            data_template:
+                entity_id: cover.bedroom_blinds 
+    - timing:
+       - ON for at most 1s
+       - OFF for at least 0.2s
+      then:
+      - logger.log: "Single Short Clicked"
+      - light.toggle: bedroom_light
+
+
+
+    
+  - platform: gpio
+    id: master_button
+    pin:
+      number: GPIO3
+      #mode: INPUT
+      mode: INPUT_PULLUP
+      inverted: True
+    on_multi_click:
+    - timing:
+        - ON for at most 1s
+        - OFF for at most 0.3s
+        - ON for at most 1s
+        - OFF for at least 0.2s
+      then:
+      - logger.log: "Double Clicked"
+      - homeassistant.service:
+            service: scene.turn_on
+            data_template:
+                entity_id: scene.master_blind_open
+    - timing:
+        - ON for 1s to 2s
+        - OFF for at least 0.2s
+      then:
+      - logger.log: "Single Long Clicked"
+      - homeassistant.service: 
+          service: light.toggle
+          data_template:
+            entity_id: light.stair_light
+            effect: Rise light
+    - timing:
+       - ON for at most 1s
+       - OFF for at least 0.2s
+      then:
+      - logger.log: "Single Short Clicked"
+      - light.toggle: master_light 

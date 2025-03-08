@@ -1,0 +1,124 @@
+light:
+  - platform: binary
+    id: bedroom_light
+    name: "bedroom light"
+    restore_mode: ALWAYS_OFF
+    output: bedroom_relay
+    
+  - platform: binary
+    id: closet_light
+    name: "closet light"
+    restore_mode: ALWAYS_OFF
+    output: closet_relay  
+
+ # GPIO23 - Stair Light neopixel
+  - platform: neopixelbus
+    type: GRB
+    variant: WS2811
+    pin: GPIO14
+    num_leds: 50
+    name: "Stair Light"
+    id: "stair_light"
+    effects:                      
+      - addressable_lambda:
+          name: "Falling light"
+          update_interval: 10ms
+          lambda: |-
+            static auto TAG = "Falling light";
+            static uint16_t progress = 0;
+            static ESPHSVColor mYellow = ESPHSVColor(40, 255, 255);
+            static ESPHSVColor mYellow = ESPHSVColor(40, 255, 255);
+            if (initial_run) {
+              progress = 0;
+              it.all() = Color::BLACK;
+              ESP_LOGD(TAG, "initial run");
+              ESP_LOGD(TAG, "it.size() =  %d", it.size());
+            }
+            else {
+              //yellow led appear at start of strip and falling down
+              if (progress < it.size()) {
+                it[progress] = mYellow;
+                progress++;
+                //ESP_LOGD(TAG, "increas progress : %d", progress);
+              }
+              //when all leds get yellow light, do nothing
+              else {
+                }
+            };
+      
+      - addressable_lambda:
+          name: "Rise light"
+          update_interval: 10ms
+          lambda: |-
+            static auto TAG = "Rise light";
+            static uint16_t progress = 0;
+            static ESPHSVColor mYellow = ESPHSVColor(40, 255, 255);
+            if (initial_run) {
+              progress = 0;
+              it.all() = Color::BLACK;
+              ESP_LOGD(TAG, "initial run");
+            }
+            else {
+              //yellow led appear at the end of strip and rising up
+              if (progress < it.size()) {
+                progress++;
+                it[it.size() - progress] = mYellow;
+                //ESP_LOGD(TAG, "increas progress : %d", progress);
+              }
+              //when all leds get yellow light, do nothing
+              else {
+                }
+            };
+            
+      - addressable_lambda:
+          name: "Simple light"
+          update_interval: 10ms
+          lambda: |-
+            static auto TAG = "Simple light";
+            static uint16_t progress = 0;
+            static ESPHSVColor mhsv;
+            static ESPHSVColor mYellow = ESPHSVColor(40, 255, 255);
+            if (initial_run) {
+              progress = 0;
+              it.all() = mYellow.to_rgb();
+              mhsv = mYellow;
+              ESP_LOGD(TAG, "initial mhsv.hue is: %d", mhsv.hue);
+            }
+            else {
+              //strip change hue a litle, light blink effect when motion detected within occupied interval
+              if (progress < 5) {
+                mhsv.hue += 3;
+                it.all() = mhsv.to_rgb();
+                progress++;
+                //ESP_LOGD(TAG, "increas mhsv.hue : %d", mhsv.hue);
+              }
+              //set hue to initial value
+              else if (progress < 10) {
+                mhsv.hue -= 3;
+                it.all() = mhsv.to_rgb();
+                progress++;
+                //ESP_LOGD(TAG, "next progress : %d", progress);
+              }                  
+              else if (progress == 10) {
+                it.all() = mYellow.to_rgb();
+                progress++;
+                }
+              else {
+              
+              }
+            };     
+
+
+      - addressable_lambda:
+          name: "Falling light"
+          lambda: |-
+            for (int i = 0; i < it->size(); i++) {
+              it->set_pixel_color(i, Color(0, 255, 0)); // Example: all LEDs green
+              delay(50);
+              it->show();
+            }
+            for (int i = 0; i < it->size(); i++) {
+              it->set_pixel_color(i, Color(0, 0, 0)); // Example: all LEDs off
+              delay(50);
+              it->show();
+            }

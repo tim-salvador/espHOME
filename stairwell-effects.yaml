@@ -1,3 +1,7 @@
+substitutions:
+  update_interval_time: ${fade_speed_number}
+  update_interval_slow: 60s
+
 esphome:
   name: stairwell-effects
   friendly_name: stairwell_effects
@@ -138,6 +142,37 @@ globals:
 #      id(system_state) = 1;       // Up active
 #    }
 
+# HA tracking
+sensor:
+  - platform: template
+    name: "System State"
+    id: system_state_sensor
+    update_interval: 1s
+    lambda: 'return id(system_state);'
+    unit_of_measurement: ""
+    icon: "mdi:state-machine"
+  - platform: template
+    name: "Last PIR Triggered"
+    id: last_pir_sensor
+    update_interval: 1s
+    lambda: 'return id(last_pir);'
+    unit_of_measurement: ""
+    icon: "mdi:motion-sensor"
+  - platform: template
+    name: "Effect Finished"
+    id: effect_finished_sensor
+    update_interval: 1s
+    lambda: 'return id(effect_finished) ? 1 : 0;'
+    unit_of_measurement: ""
+    icon: "mdi:check-circle"
+  - platform: template
+    name: "Disco Mode Active"
+    id: disco_mode_sensor
+    update_interval: 1s
+    lambda: 'return id(disco_mode_active) ? 1 : 0;'
+    unit_of_measurement: ""
+    icon: "mdi:disco"
+
 ## Ambient Light Sensor
 #sensor:
 #  - platform: bh1750
@@ -189,7 +224,6 @@ number:
     optimistic: true
     set_action:
       - lambda: 'id(fade_group_size) = x;'
-
 
 binary_sensor:
   - platform: gpio
@@ -588,7 +622,8 @@ light:
           # sync_group_mask: 0
       - addressable_lambda:
           name: "Fade on DOWN"
-          update_interval: 30ms #15ms is a nice number
+          #update_interval: 30ms #15ms is a nice number
+          update_interval: 50ms
           lambda: |-
             //initializes the progress variable to 0. This variable is intended to track which LED is being lit.
             static auto TAG = "Fade on DOWN";
@@ -731,7 +766,7 @@ light:
 
       - addressable_lambda:
           name: "Group Fade on DOWN"
-          update_interval: 150ms
+          update_interval: 75ms
           lambda: |-
             static const uint16_t GROUP_SIZE = 4;
             static ESPHSVColor mColor = ESPHSVColor(255, 0, 250);
@@ -763,7 +798,7 @@ light:
 
       - addressable_lambda:
           name: "Group Fade off DOWN"
-          update_interval: 150ms
+          update_interval: 75ms
           lambda: |-
             static const uint16_t GROUP_SIZE = 4;
             static ESPHSVColor mColor = ESPHSVColor(255, 255, 0);
@@ -793,7 +828,7 @@ light:
 
       - addressable_lambda:
           name: "Group Fade on UP"
-          update_interval: 150ms
+          update_interval: 75ms
           lambda: |-
             static const uint16_t GROUP_SIZE = 4;
             static const uint16_t GAP_SIZE = 5;
@@ -827,7 +862,7 @@ light:
 
       - addressable_lambda:
           name: "Group Fade off UP"
-          update_interval: 150ms
+          update_interval: 75ms
           lambda: |-
             static const uint16_t GROUP_SIZE = 4;
             static const uint16_t GAP_SIZE = 5;
@@ -858,40 +893,7 @@ light:
             // Expose the completion status to global
             id(effect_finished) = effect_complete;
 
-      - addressable_lambda:
-          name: "Addressable Fade"
-          update_interval: 30ms #15ms is a nice number
-          lambda: |-
-            static uint16_t progress = 0;
-            static ESPHSVColor targetColor;
-            static bool fadeUp;
 
-            if (initial_run) {
-              progress = 0;
-              targetColor = ESPHSVColor(255, 0, 250);
-              fadeUp = true;
-              return;
-            }
-
-            if (id(down_sequence_active)) {
-              targetColor = ESPHSVColor(255, 0, 250);
-              fadeUp = true;
-            } else if (id(up_sequence_active)) {
-              targetColor = ESPHSVColor(255, 255, 0);
-              fadeUp = false;
-            }
-
-            if (fadeUp) {
-              if (progress < it.size()) {
-                it[it.size() - progress - 1] = targetColor;
-                progress++;
-              }
-            } else {
-              if (progress < it.size()) {
-                it[progress] = targetColor;
-                progress++;
-              }
-            }
       - addressable_color_wipe:
           name: forward wipe
           colors:

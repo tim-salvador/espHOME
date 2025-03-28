@@ -5,6 +5,13 @@ esphome:
     priority: -10
     then:
       - light.turn_off: stair_light
+      - lambda: |
+          id(system_state) = 0;
+          id(up_sequence_active) = false;
+          id(down_sequence_active) = false;
+          id(effect_finished) = false;
+          id(last_trigger_time) = 0;
+          id(last_pir) = 0;
 
 esp8266:
   board: esp01_1m
@@ -35,6 +42,7 @@ web_server:
 
 
 globals:
+  ## need to clean up the globals
   - id: light_state
     type: int
     restore_value: no
@@ -61,15 +69,6 @@ globals:
     type: int
     restore_value: no
     initial_value: '0'
-
-  #- id: led_color_on
-  #  type: esp_color::ESPHSVColor
-  #  restore_value: yes
-  #  initial_value: 'esphsv(255, 0, 250)' # Default color
-  #- id: led_color_off
-  #  type: esp_color::ESPHSVColor
-  #  restore_value: yes
-  #  initial_value: 'esphsv(255, 255, 0)' # Default color
   - id: led_group_size
     type: int
     restore_value: yes
@@ -82,13 +81,54 @@ globals:
     type: bool
     restore_value: no
     initial_value: 'false'
+# Used to track last triggered 
+  - id: last_trigger_time
+    type: long
+    initial_value: '0'
+  - id: last_pir_cleared_time
+    type: long
+    initial_value: '0'
+  - id: effect_finished  # New global to track effect completion
+    type: bool
+    initial_value: 'false'
+
+
+## Would like to add a system status that encorporates multiple globals.  for example
+  - id: system_state
+    type: int
+    initial_value: '0'  # 0 = idle, 1 = up_active, 2 = down_active, 3 = cooling_down
+## From the i could Update logic to use system_state instead of multiple booleans:
+## Example
+#- lambda: |
+#    if (id(system_state) == 0) {  // Idle
+#      id(last_trigger_time) = millis();
+#      id(system_state) = 1;       // Up active
+#    }
+
+## Ambient Light Sensor
+#sensor:
+#  - platform: bh1750
+#    name: "Ambient Light"
+#    id: ambient_light
+#    update_interval: 60s
+#light:
+#  - platform: neopixelbus
+#    ...
+#    on_state:
+#      then:
+#        - lambda: |
+#            if (id(ambient_light).state < 50) {  // Lux threshold
+#              id(stair_light).turn_on().set_brightness(0.8);
+#            } else {
+#              id(stair_light).turn_on().set_brightness(0.4);
+#            }
 
 number:
   - platform: template
     name: "LED Group Size"
     id: led_group_size_number
     min_value: 1
-    max_value: 50 # Adjust as needed
+    max_value: 4 # Adjust as needed
     step: 1
     restore_value: yes
     optimistic: true
@@ -111,29 +151,59 @@ number:
 binary_sensor:
   - platform: gpio
     pin:
-      number: 14
+      number: 12
       #mode: INPUT_PULLUP
       #inverted: true 
     name: "PIR Sensor (Upper)"
     id: upper_pir_sensor
+    filters:
+      - delayed_on: 100ms  # Debounce on
+      - delayed_off: 200ms # Debounce off    
     device_class: motion
-    ### This works one way right now.  the logic is from upper to lower.  now need to do the reverse.  
     on_press:
       then:
         - if:
             condition:
-              lambda: 'return id(up_sequence_active) == false;'
+               lambda: 'return ((!id(up_sequence_active) && !id(down_sequence_active)) || (!id(up_sequence_active) && id(light_state) == 0));'  # Only trigger if no sequence is active
+              #lambda: 'return id(up_sequence_active) == false;'
             then:
-      #        - light.turn_on:
-      #            id: stair_light
               - light.turn_on:
                   id: stair_light
                   effect: "Fade on DOWN"
-              - lambda: 'id(down_sequence_active) = true;'
+              - wait_until:
+                  condition:
+                    lambda: 'return id(effect_finished);'
+              - lambda: |
+                  id(down_sequence_active) = true;
+                  id(effect_finished) = false;
+                  id(last_trigger_time) = millis();
+                  id(last_pir) = 2;
+                  id(light_state) = 1;
+                #- delay: 6s
+          ## same trigger going up half way then back down 
+        - if:
+            condition:
+              lambda: 'return (id(effect_finished) && id(last_pir) == 2 && id(down_sequence_active) && id(light_state) == 1 );'
+              #lambda: 'return (id(last_trigger_time) > 4000 && id(last_pir) == 1 && id(up_sequence_active) && !id(lower_pir_sensor).state);'
+              #lambda: 'return (id(last_pir) == 1 && id(up_sequence_active) && !id(lower_pir_sensor).state);'
+            then:
+              - light.turn_on:
+                  id: stair_light
+                  effect: "Fade off UP"
+              - wait_until:
+                  condition:
+                    lambda: 'return id(effect_finished);'
+              - lambda: |
+                  id(down_sequence_active) = false;
+                  id(effect_finished) = false;
+                  id(last_trigger_time) = 0;
+                  id(last_pir) = 0;
+                  id(light_state) = 0;
 
-    ### This works one way right now.  the logic is from upper to lower.  now need to do the reverse.  
+
     on_release:
       then:
+        - lambda: 'id(last_pir_cleared_time) = millis();'
         - if:
             condition:
               lambda: 'return (id(up_sequence_active) == true && id(down_sequence_active) == false);'
@@ -145,97 +215,92 @@ binary_sensor:
               - light.turn_on:
                   id: stair_light
                   effect: "Fade off UP"
-              - delay: 10s
-              - lambda: 'id(up_sequence_active) = false;'
+              - wait_until:
+                  condition:
+                    lambda: 'return id(effect_finished);'
+              - lambda: |
+                  id(up_sequence_active) = false;
+                  id(effect_finished) = false;
+                  id(last_pir_cleared_time) = 0;
+                  id(last_trigger_time) = 0;
 
-
-#    on_press:
-#      then:
-#        # Record the time of the PIR trigger
-#        - lambda: |-
-#            id(upper_pir_time) = millis();
-#            id(last_pir) = 2;  
-#            // Mark this as the last PIR triggered
-#      then:
-#        - if:
-#            condition:
-#              lambda: return id(light_state) == 0;
-#            then:
-              
-#              - logger.log:
-#                  format: "Upper PIR: Condition met, light_state: %d"
-#                  args:
-#                    - id(light_state)
-#              - light.turn_on:
-#                  id: stair_light
-#                  effect: "Fade on DOWN"
-#              - lambda: 'id(light_state) = 2;'
-#            else:
-#              - lambda: 'id(light_state) = 1;'
-#              - light.turn_on:
-#                  id: stair_light
-#                  effect: "Fade off UP"
-#              - logger.log:
-#                  format: "Upper PIR: Condition not met, light_state: %d"
-#                  args:
-#                    - id(light_state)
-#    on_release:
-#      - light.turn_on:
-#          id: stair_light
-#          effect: "Fade off DOWN"
-#      - delay: 2s  # Corrected indentation
-#      - lambda: 'id(light_state) = 0;'
-
-
-    ### Havn't tested this yet  
-#    on_release:
-#      then:
-#        - if:
-#3            condition:
-#              lambda: 'return id(up_sequence_active) == true && id(down_sequence_active) == false;'
-#            then:
-#              - wait_until:
-#                  condition:
-#                    binary_sensor.is_off: upper_pir_sensor
-#                  timeout: 20s
-#              - light.turn_on:
-#                  id: stair_light
-#                  effect: "Fade off Up"
-#              - delay: 5s
-#              - lambda: 'id(up_sequence_active) = false;'
+              - delay: 
+                  6s
+              - light.turn_off:
+                  id: stair_light              
 
 
   - platform: gpio
     pin:
-      number: 12
+      number: 14
       #mode: INPUT_PULLUP
-      #inverted: true # used due to gpio pulling high on boot
+      #inverted: true 
     name: "PIR Sensor (Lower)"
     id: lower_pir_sensor
     device_class: motion
+    filters:
+      - delayed_on: 100ms  # Debounce on
+      - delayed_off: 200ms # Debounce off    
     on_press:
-      then:
-        - if:
-            condition:
-              lambda: 'return id(down_sequence_active) == false;'
-            then:
-      #        - light.turn_on:
-      #            id: stair_light
-              - light.turn_on:
-                  id: stair_light
-                  effect: "Fade on UP"
-              - lambda: 'id(up_sequence_active) = true;'
-#    on_press:
-#      then:
-#        - light.turn_on:
-#            id: stair_light
-#        - light.turn_on:
-#            id: stair_light
-#            effect: "Fade on UP"
-#        - lambda: 'id(up_sequence_active) = true;'
-    ### This works one way right now.  the logic is from upper to lower.  now need to do the reverse.  
+        then:
+          #- lambda: |-
+          #      ESP_LOGD("Global Variables", "PIR Sensor (Lower) before condition");
+          #      ESP_LOGD("Global Variables", "light_state: %i", id(light_state));
+          #      ESP_LOGD("Global Variables", "up_sequence_active: %s", id(up_sequence_active) ? "true" : "false");
+          #      ESP_LOGD("Global Variables", "down_sequence_active: %s", id(down_sequence_active) ? "true" : "false");
+          #      ESP_LOGD("Global Variables", "last_pir: %i", id(last_pir));
+          #      ESP_LOGD("Global Variables", "last_trigger_time: %li", id(last_trigger_time));
+          #      ESP_LOGD("Global Variables", "last_pir_cleared_time: %li", id(last_pir_cleared_time));
+          #      ESP_LOGD("Global Variables", "effect_finished: %s", id(effect_finished) ? "true" : "false");
+
+          ## new trigger
+          - if:
+              condition:
+                and:
+                  - lambda: 'return ((!id(up_sequence_active) && !id(down_sequence_active)) || (!id(down_sequence_active) && id(light_state) == 0));'
+                  #- lambda: 'return id(last_pir) == 1 && (millis() - id(last_trigger_time)) < 5000;'
+                  #- binary_sensor.is_on: lower_pir_sensor
+              then:
+                - light.turn_on:
+                    id: stair_light
+                    effect: "Fade on UP"
+                - wait_until:
+                    condition:
+                      lambda: 'return id(effect_finished);'
+                - lambda: |
+                    id(up_sequence_active) = true;
+                    id(effect_finished) = false;
+                    id(last_trigger_time) = millis();
+                    id(last_pir) = 1;
+                    id(light_state) = 1;
+                #- delay: 6s
+          ## same trigger going up half way then back down 
+          - if:
+              condition:
+                and:
+                  - lambda: 'return (id(effect_finished) && id(last_pir) == 1 && id(up_sequence_active) && id(light_state) == 1 );'
+                  #- lambda: 'return id(last_pir) == 1 && (millis() - id(last_trigger_time)) < 5000;'
+                  #- binary_sensor.is_on: lower_pir_sensor
+                  # - lambda: 'return (id(last_trigger_time) > 4000 && id(last_pir) == 1 && id(up_sequence_active) && !id(lower_pir_sensor).state);'
+                  # - lambda: 'return (id(last_pir) == 1 && id(up_sequence_active) && !id(lower_pir_sensor).state);'
+                  # - lambda: 'return (millis() - id(last_trigger_time)) > 500;'  # 500ms cooldown
+              then:
+                - light.turn_on:
+                    id: stair_light
+                    effect: "Fade off Down"
+                - wait_until:
+                    condition:
+                      lambda: 'return id(effect_finished);'
+                - lambda: |
+                    id(up_sequence_active) = false;
+                    id(effect_finished) = false;
+                    id(last_trigger_time) = 0;
+                    id(last_pir) = 0;
+                    id(light_state) = 0;
+
     on_release:
       then:
+        - lambda: 'id(last_pir_cleared_time) = millis();'
         - if:
             condition:
               lambda: 'return (id(down_sequence_active) == true && id(up_sequence_active) == false);'
@@ -247,69 +312,112 @@ binary_sensor:
               - light.turn_on:
                   id: stair_light
                   effect: "Fade off Down"
-              - delay: 10s
-              - lambda: 'id(down_sequence_active) = false;'
-#              - light.turn_off:
-#                  id: stair_light
+              - wait_until:
+                  condition:
+                    lambda: 'return id(effect_finished);'
+              - lambda: |
+                  id(down_sequence_active) = false;
+                  id(effect_finished) = false;
+                  id(last_pir_cleared_time) = 0;
+                  id(last_trigger_time) = 0;
+              - delay: 
+                  6s
+              - light.turn_off:
+                  id: stair_light
 
-
-
-#    on_press:
-#      then:
-#        - lambda: 'id(upper_pir_time) = millis();'
-#        - if:
-#            condition:
-#              lambda: return id(light_state) == 0;
-#            then:
-#              - logger.log:
-#                  format: "Lower PIR: Condition met, light_state: %d"
-#                  args:
-#                    - id(light_state)
-#              - light.turn_on:
-#                  id: stair_light
-#                  effect: "Fade on UP"
-#              - lambda: 'id(light_state) = 1;'
-#            else:
-#              - lambda: 'id(light_state) = 2;'
-#              - light.turn_on:
-#                  id: stair_light
-#                  effect: "Fade off DOWN"
-#              - logger.log:
-#                  format: "Lower PIR: Condition not met, light_state: %d" # corrected line
-#                  args:
-#                    - id(light_state)
-#    on_release:
-#      then:
-#        - lambda: |-
-#            if (id(upper_pir_time) > id(lower_pir_time)) {
-#              // Upper PIR triggered more recently
-#            } else {
-#              // Lower PIR triggered more recently
-#            }
-#    on_release:
-#      - light.turn_on:
-#          id: stair_light
-#          effect: "Fade off DOWN"
-#      - delay: 2s  # Corrected indentation
-#      - lambda: 'id(light_state) = 0;'
-
+# Automation for special scenarios
+#The interval component checks every second if:
+#    The LED is on
+#    60 seconds have passed since last trigger
+#    Both PIRs are off
+interval:
+  - interval: 10s
+    then:
+      - lambda: |-
+            ESP_LOGD("Global Variables", "PIR Sensor (Lower) before condition");
+            ESP_LOGD("Global Variables", "light_state: %i", id(light_state));
+            ESP_LOGD("Global Variables", "up_sequence_active: %s", id(up_sequence_active) ? "true" : "false");
+            ESP_LOGD("Global Variables", "down_sequence_active: %s", id(down_sequence_active) ? "true" : "false");
+            ESP_LOGD("Global Variables", "last_pir: %i", id(last_pir));
+            ESP_LOGD("Global Variables", "last_trigger_time: %li", id(last_trigger_time));
+            ESP_LOGD("Global Variables", "last_pir_cleared_time: %li", id(last_pir_cleared_time));
+            ESP_LOGD("Global Variables", "effect_finished: %s", id(effect_finished) ? "true" : "false");
+      # Conditional debug logging 
+      #### need to test
+      #- if:
+      #    condition:
+      #      lambda: 'return ESPHOME_LOG_LEVEL >= ESPHOME_LOG_LEVEL_DEBUG;'
+      #    then:
+      #      - lambda: |-
+      #            //ESP_LOGD("Global Variables", "PIR Sensor (Lower) before condition");
+      #            ESP_LOGD("Global Variables", "light_state: %i", id(light_state));
+      #            ESP_LOGD("Global Variables", "up_sequence_active: %s", id(up_sequence_active) ? "true" : "false");
+      #            ESP_LOGD("Global Variables", "down_sequence_active: %s", id(down_sequence_active) ? "true" : "false");
+      #            ESP_LOGD("Global Variables", "last_pir: %i", id(last_pir));
+      #            ESP_LOGD("Global Variables", "last_trigger_time: %li", id(last_trigger_time));
+      #            ESP_LOGD("Global Variables", "last_pir_cleared_time: %li", id(last_pir_cleared_time));
+      #            ESP_LOGD("Global Variables", "effect_finished: %s", id(effect_finished) ? "true" : "false");
+      # Scenario 1: 1-minute timeout
+      - if:
+          condition:
+            and:
+              - light.is_on: stair_light
+              - lambda: 'return (millis() - id(last_trigger_time)) > 60000 && id(effect_finished);'
+              - binary_sensor.is_off: upper_pir_sensor
+              - binary_sensor.is_off: lower_pir_sensor
+              #- lambda: 'return !id(up_sequence_active) && !id(down_sequence_active);'  # Only if no sequence is active
+          then:
+            - light.turn_off: stair_light
+            - lambda: |
+                id(up_sequence_active) = false;
+                id(down_sequence_active) = false;
+                id(effect_finished) = false;
+                id(light_state) = 0;
+                id(last_trigger_time) = 0;
+                id(last_pir) = 0;
+      # Recovery from stuck state
+      - if:
+          condition:
+            and:
+              - light.is_on: stair_light
+              - lambda: 'return !id(up_sequence_active) && !id(down_sequence_active) && id(effect_finished) && (millis() - id(last_trigger_time)) > 60000;'
+              - binary_sensor.is_off: upper_pir_sensor
+              - binary_sensor.is_off: lower_pir_sensor
+          then:
+            - light.turn_off: stair_light
+            - lambda: |
+                id(light_state) = 0;
+                id(last_trigger_time) = 0;
+                id(last_pir) = 0;
+                ESP_LOGD("interval", "Recovered from stuck state");
+      # Scenario 2: Same PIR after 25s clear (Lower PIR)
+#      - if:
+#          condition:
+#            and:
+#              - lambda: 'return (millis() - id(last_pir_cleared_time)) > 10000;'
+#              - lambda: 'return id(last_pir) == 1 && id(lower_pir_sensor)->state;'
+#          then:
+#            - light.turn_on:
+#                id: stair_light
+#                effect: "Fade off DOWN"
+#                # changed to from true to false
+#            - lambda: 'id(up_sequence_active) = false;'
+      # Scenario 2: Same PIR after 25s clear (Upper PIR)
+#      - if:
+#          condition:
+#            and:
+#              - lambda: 'return (millis() - id(last_pir_cleared_time)) > 10000;'
+#              - lambda: 'return id(last_pir) == 2 && id(upper_pir_sensor)->state;'
+#          then:
+#            - light.turn_on:
+#                id: stair_light
+#                effect: "Fade off UP"
+                # changed to from true to false                
+#            - lambda: 'id(down_sequence_active) = false;'
 
 wled:
 
-
 light:
-#  - platform: monochromatic
-#    name: "LED Color Control"
-#    id: led_color_light
-#    restore_value: yes
-#    effects:
-#      - lambda: |-
-#          return ESPColor(id(led_color));
-#    on_turn_on:
-#      - lambda: |-
-#          id(led_color) = x.get_hsv();
-
-
   - platform: neopixelbus
     type: GRB
     variant: WS2811
@@ -323,95 +431,17 @@ light:
           # port: 21324
           # blank_on_start: True
           # sync_group_mask: 0
-      - automation:
-          name: "Custom Automation Effect"
-          sequence:
-            - light.addressable_set:
-                id: stair_light
-                red: 100%
-                green: 100%
-                blue: 100%
-            - delay: 100ms
-            - light.addressable_set:
-                id: stair_light
-                range_from: 0
-                range_to: 20
-                red: 100%
-                green: 0%
-                blue: 0%
       - addressable_lambda:
-          name: "bonus2"
-          update_interval: 16ms
-          lambda: |-
-            // Static variables keep their value even when
-            // stopping and starting the effect again
-            static uint16_t progress = 0;
-
-            // normal variables lose their value after each
-            // execution - basically after each update_interval
-            uint16_t changes = 0;
-
-            // To reset static when stopping and starting the effect
-            // again you can use the initial_run variables
-            if (initial_run) {
-              progress = 0;
-              it.all() = Color::BLACK;
-              // optionally do a return so nothing happens until the next update_interval
-              return;
-            }
-      - addressable_lambda:
-          name: "bonus"
-          update_interval: 15ms
-          lambda: |-
-            // it.size() - Number of LEDs
-            // it[num] - Access the LED at index num.
-            // Set the LED at num to the given r, g, b values
-            // it[num] = Color(r, g, b);
-            // Get the color at index num (Color instance)
-            // it[num].get();
-
-            // Example: Simple color wipe
-            for (int i = it.size() - 1; i > 0; i--) {
-              it[i] = it[i - 1].get();
-            }
-            it[0] = Color::random_color();
-
-            // Bonus: use .range() and .all() to set many LEDs without having to write a loop.
-            //it.range(0, 50) = Color::BLACK;
-            //it.all().fade_to_black(10);
-      - lambda:
-          name: unknown
-          update_interval: 1s
-          lambda: |-
-            static int state = 0;
-            auto call = id(stair_light).turn_on();
-            // Transition of 1000ms = 1s
-            call.set_transition_length(1000);
-            if (state == 0) {
-              call.set_rgb(1.0, 1.0, 1.0);
-            } else if (state == 1) {
-              call.set_rgb(1.0, 0.0, 1.0);
-            } else if (state == 2) {
-              call.set_rgb(0.0, 0.0, 1.0);
-            } else {
-              call.set_rgb(1.0, 0.0, 0.0);
-            }
-            call.perform();
-            state += 1;
-            if (state == 4)
-              state = 0;
-
-
-      - addressable_lambda:
-          name: "Fade on UP"
-          update_interval: 15ms
+          name: "Fade on DOWN"
+          update_interval: 30ms #15ms is a nice number
           lambda: |-
             //initializes the progress variable to 0. This variable is intended to track which LED is being lit.
-            static auto TAG = "Fade on UP";
+            static auto TAG = "Fade on DOWN";
             static ESPHSVColor mColor = ESPHSVColor(255, 0, 250);
             // Static variables keep their value even when
             // stopping and starting the effect again
             static uint16_t progress = 0;
+            static bool effect_complete = false;  // New flag to track completion
 
             // normal variables lose their value after each
             // execution - basically after each update_interval
@@ -422,30 +452,103 @@ light:
             // initial_run resets the progress to 0.
             if (initial_run) {
               progress = 0;
+              effect_complete = false;  // Reset completion flag
+              it.all() = Color::BLACK;
+              ESP_LOGD("effect", "Fade on DOWN started");
+              // optionally do a return so nothing happens until the next update_interval
+              return;
+            }
+
+            if (progress < it.size()) {
+              progress++;
+              it[it.size() - progress] = mColor;
+              effect_complete = false;
+              //ESP_LOGD("effect", "Progress: %d", progress);
+            } else {
+              effect_complete = true;
+            }
+            id(effect_finished) = effect_complete;
+
+
+      - addressable_lambda:
+          name: "Fade off DOWN"
+          update_interval: 30ms #15ms is a nice number
+          lambda: |-
+            static auto TAG = "Fade off DOWN";
+            static ESPHSVColor mBlack = ESPHSVColor(255, 255, 0);
+            // Static variables keep their value even when
+            // stopping and starting the effect again
+            static uint16_t progress = 0;
+            static bool effect_complete = false;  // New flag to track completion
+
+            // normal variables lose their value after each
+            // execution - basically after each update_interval
+            uint16_t changes = 0;
+
+            // To reset static when stopping and starting the effect
+            // again you can use the initial_run variables
+            if (initial_run) {
+              progress = 0;
+              effect_complete = false;  // Reset completion flag
               //it.all() = Color::BLACK;
               // optionally do a return so nothing happens until the next update_interval
               return;
             }
-            //if (progress == 0) {
-              //it[it.size() - 1] = mBlack;  // Light the first LED
-              //progress = 1;  // Start progress
-            //}
-            // This condition checks if the current progress is within the bounds of the LED strip.
-            //  incremented to 1.
+
             if (progress < it.size()) {
               progress++;
-              it[it.size() - progress] = mColor;
+              it[it.size() - progress] = mBlack;
+              effect_complete = false;
+            } else {
+              effect_complete = true;
+            }
+            id(effect_finished) = effect_complete;
+
+      - addressable_lambda:
+          name: "Fade on UP"
+          update_interval: 30ms #15ms is a nice number
+          lambda: |-
+            static auto TAG = "Fade on UP";
+            static ESPHSVColor mColor = ESPHSVColor(255, 0, 250);
+            // Static variables keep their value even when
+            // stopping and starting the effect again
+            static uint16_t progress = 0;
+            static bool effect_complete = false;  // New flag to track completion
+
+            // normal variables lose their value after each
+            // execution - basically after each update_interval
+            uint16_t changes = 0;
+
+            // To reset static when stopping and starting the effect
+            // again you can use the initial_run variables
+            if (initial_run) {
+              progress = 0;
+              effect_complete = false;  // Reset completion flag
+              it.all() = Color::BLACK;
+              // optionally do a return so nothing happens until the next update_interval
+              return;
+            }
+
+            if (progress < it.size()) {
+              it[progress] = mColor;
+              progress++;
+              effect_complete = false;  // Effect still running
+            } else {
+              effect_complete = true;   // Effect has finished
             };
+            // Expose the completion status to global
+            id(effect_finished) = effect_complete;
 
       - addressable_lambda:
           name: "Fade off UP"
-          update_interval: 15ms
+          update_interval: 30ms #15ms is a nice number
           lambda: |-
             static auto TAG = "Fade off UP";
             static ESPHSVColor mBlack = ESPHSVColor(255, 255, 0);
             // Static variables keep their value even when
             // stopping and starting the effect again
             static uint16_t progress = 0;
+            static bool effect_complete = false;  // New flag to track completion
 
             // normal variables lose their value after each
             // execution - basically after each update_interval
@@ -455,83 +558,21 @@ light:
             // again you can use the initial_run variables
             if (initial_run) {
               progress = 0;
-              //it.all() = Color::BLACK;
-              // optionally do a return so nothing happens until the next update_interval
-              return;
-            }
-            //if (progress == 0) {
-              //it[it.size() - 1] = mBlack;  // Light the first LED
-              //progress = 1;  // Start progress
-            //}
-            if (progress < it.size()) {
-              progress++;
-              it[it.size() - progress] = mBlack;
-            };
-
-      - addressable_lambda:
-          name: "Fade on DOWN"
-          update_interval: 15ms
-          lambda: |-
-            static auto TAG = "Fade on Down";
-            static ESPHSVColor mColor = ESPHSVColor(255, 0, 250);
-            // Static variables keep their value even when
-            // stopping and starting the effect again
-            static uint16_t progress = 0;
-
-            // normal variables lose their value after each
-            // execution - basically after each update_interval
-            uint16_t changes = 0;
-
-            // To reset static when stopping and starting the effect
-            // again you can use the initial_run variables
-            if (initial_run) {
-              progress = 0;
-              it.all() = Color::BLACK;
-              // optionally do a return so nothing happens until the next update_interval
-              return;
-            }
-            //if (progress == 0) {
-              // Reset progress when the effect starts
-              //progress = 1;
-              //it[progress] = mColor;
-            //}
-            if (progress < it.size()) {
-              it[progress] = mColor;
-              progress++;
-            };
-      - addressable_lambda:
-          name: "Fade off DOWN"
-          update_interval: 15ms
-          lambda: |-
-            static auto TAG = "Fade off Down";
-            static ESPHSVColor mBlack = ESPHSVColor(255, 255, 0);
-            // Static variables keep their value even when
-            // stopping and starting the effect again
-            static uint16_t progress = 0;
-
-            // normal variables lose their value after each
-            // execution - basically after each update_interval
-            uint16_t changes = 0;
-
-            // To reset static when stopping and starting the effect
-            // again you can use the initial_run variables
-            if (initial_run) {
-              progress = 0;
+              effect_complete = false;  // Reset completion flag
               // it.all() = Color::BLACK;
               // optionally do a return so nothing happens until the next update_interval
               return;
             }
-            ESP_LOGD("lambda", "progress: %d", progress);
-            //if (progress == 0) {
-              // Reset progress when the effect starts
-              //progress = 1;
-              //it[progress] = mBlack;
-            //}
+
             if (progress < it.size()) {
               it[progress] = mBlack;
               progress++;
-            };
-
+              effect_complete = false;  // Effect still running
+            } else {
+              effect_complete = true;   // Effect has finished
+            }
+            // Expose the completion status to global
+            id(effect_finished) = effect_complete;
 
       - addressable_lambda:
           name: "Group Fade on UP"
@@ -540,6 +581,7 @@ light:
             static const uint16_t GROUP_SIZE = 10;
             static ESPHSVColor mColor = ESPHSVColor(255, 0, 250);
             static uint16_t progress = 0;
+            static bool effect_complete = false;  // New flag to track completion
 
             if (initial_run) {
               progress = 0;
@@ -563,6 +605,7 @@ light:
             static const uint16_t GROUP_SIZE = 10;
             static ESPHSVColor mColor = ESPHSVColor(255, 255, 0);
             static uint16_t progress = 0;
+            static bool effect_complete = false;  // New flag to track completion
 
             if (initial_run) {
               progress = 0;
@@ -587,6 +630,7 @@ light:
             static const uint16_t GAP_SIZE = 5;
             static ESPHSVColor mColor = ESPHSVColor(255, 0, 250);
             static uint16_t progress = 0;
+            static bool effect_complete = false;  // New flag to track completion
 
             if (initial_run) {
               progress = 0;
@@ -612,6 +656,7 @@ light:
             static const uint16_t GAP_SIZE = 5;
             static ESPHSVColor mColor = ESPHSVColor(255, 255, 0);
             static uint16_t progress = 0;
+            static bool effect_complete = false;  // New flag to track completion
 
             if (initial_run) {
               progress = 0;
@@ -632,7 +677,7 @@ light:
 
       - addressable_lambda:
           name: "Addressable Fade"
-          update_interval: 15ms
+          update_interval: 30ms #15ms is a nice number
           lambda: |-
             static uint16_t progress = 0;
             static ESPHSVColor targetColor;
@@ -664,35 +709,6 @@ light:
                 progress++;
               }
             }
-
-      - addressable_scan:
-          name: Scan Effect With Custom Values
-          move_interval: 100ms
-          scan_width: 1
-      - random:
-          name: Random Effect With Custom Values
-          transition_length: 5s
-          update_interval: 7s
-      - pulse:
-          name: "Fast Pulse"
-          transition_length: 0.5s
-          update_interval: 0.5s
-          min_brightness: 0%
-          max_brightness: 100%
-      - pulse:
-          name: "Slow Pulse"
-          transition_length: 500ms
-          update_interval: 2s
-      - pulse:
-          name: "Asymmetrical Pulse"
-          transition_length:
-            on_length: 1s
-            off_length: 500ms
-          update_interval: 1.5s
-      - addressable_scan:
-          name: "round2"
-          move_interval: 100ms
-          scan_width: 10
       - addressable_color_wipe:
           name: forward wipe
           colors:
@@ -725,22 +741,7 @@ light:
           name: Rainbow Effect With Custom Values
           speed: 10
           width: 50
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+      - pulse:
+          name: "Pulse"
+          transition_length: 0.5s
+          update_interval: 0.5s

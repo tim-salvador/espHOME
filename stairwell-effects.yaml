@@ -32,6 +32,8 @@ wifi:
 captive_portal:
 
 api:
+  encryption:
+    key: !secret api_encryption_key
 
 ota:
   - platform: esphome

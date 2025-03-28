@@ -91,6 +91,37 @@ globals:
   - id: effect_finished  # New global to track effect completion
     type: bool
     initial_value: 'false'
+# Added globals for Easter egg
+  - id: disco_trigger_count
+    type: int
+    initial_value: '0'
+  - id: last_disco_trigger_time
+    type: long
+    initial_value: '0'
+  - id: disco_mode_active
+    type: bool
+    initial_value: 'false'
+  # Easter Egg 2
+  - id: knock_count
+    type: int
+    initial_value: '0'
+  - id: last_knock_time
+    type: long
+    initial_value: '0'
+  # Easter Egg 3
+  - id: both_pir_start_time
+    type: long
+    initial_value: '0'
+  # used for unification of fade actions
+  - id: fade_direction_up
+    type: bool
+    initial_value: 'true'  # true = up, false = down
+  - id: fade_on
+    type: bool
+    initial_value: 'true'  # true = on (white), false = off (black)
+  - id: fade_group_size
+    type: int
+    initial_value: '1'     # Number of LEDs to light at a time
 
 
 ## Would like to add a system status that encorporates multiple globals.  for example
@@ -145,7 +176,17 @@ number:
     optimistic: true
     set_action:
       - lambda: 'id(led_gap_size) = x;'
-
+  # used for unification of fade actions
+  - platform: template
+    name: "Fade Group Size"
+    id: fade_group_size_number
+    min_value: 1
+    max_value: 10  # Adjust as needed
+    step: 1
+    restore_value: yes
+    optimistic: true
+    set_action:
+      - lambda: 'id(fade_group_size) = x;'
 
 
 binary_sensor:
@@ -162,14 +203,35 @@ binary_sensor:
     device_class: motion
     on_press:
       then:
+        # Easter egg trigger check for disco mode
+        # Trigger: Activate both PIR sensors (upper and lower) simultaneously three times within a 5-second window.
+        # Effect: "Disco Mode" activates, creating a colorful, rotating rainbow pattern across all LEDs.
+        # Duration: The effect runs for 10 seconds before automatically turning off and resetting the system.
+        # Visual: LEDs cycle through hues with a smooth rainbow effect, shifting colors every 200ms.
+        - lambda: |
+            if (id(lower_pir_sensor).state) {  // Both PIRs active
+              if (millis() - id(last_disco_trigger_time) < 5000) {
+                id(disco_trigger_count)++;
+              } else {
+                id(disco_trigger_count) = 1;  // Reset count if too much time passed
+              }
+              id(last_disco_trigger_time) = millis();
+              if (id(disco_trigger_count) >= 3 && !id(disco_mode_active)) {
+                id(disco_mode_active) = true;
+                id(stair_light).turn_on().set_effect("Disco Mode");
+              }
+            }
+        ## Trigger to test unified fade 
         - if:
             condition:
-               lambda: 'return ((!id(up_sequence_active) && !id(down_sequence_active)) || (!id(up_sequence_active) && id(light_state) == 0));'  # Only trigger if no sequence is active
-              #lambda: 'return id(up_sequence_active) == false;'
+              lambda: 'return ((!id(up_sequence_active) && !id(down_sequence_active)) || (!id(up_sequence_active) && id(light_state) == 0));'
             then:
+              - lambda: |
+                  id(fade_direction_up) = false;  // Down
+                  id(fade_on) = true;             // On (white)
               - light.turn_on:
                   id: stair_light
-                  effect: "Fade on DOWN"
+                  effect: "Fade Control"
               - wait_until:
                   condition:
                     lambda: 'return id(effect_finished);'
@@ -179,8 +241,26 @@ binary_sensor:
                   id(last_trigger_time) = millis();
                   id(last_pir) = 2;
                   id(light_state) = 1;
-                #- delay: 6s
-          ## same trigger going up half way then back down 
+
+        ## Default Action for Going Down
+        #- if:
+        #    condition:
+        #       lambda: 'return ((!id(up_sequence_active) && !id(down_sequence_active)) || (!id(up_sequence_active) && id(light_state) == 0));'  # Only trigger if no sequence is active
+        #    then:
+        #      - light.turn_on:
+        #          id: stair_light
+        #          effect: "Group Fade on DOWN"
+        #      - wait_until:
+        #          condition:
+        #            lambda: 'return id(effect_finished);'
+        #      - lambda: |
+        #          id(down_sequence_active) = true;
+        #          id(effect_finished) = false;
+        #          id(last_trigger_time) = millis();
+        #          id(last_pir) = 2;
+        #          id(light_state) = 1;
+          
+        ## Default Action for turning halfway and going back Up 
         - if:
             condition:
               lambda: 'return (id(effect_finished) && id(last_pir) == 2 && id(down_sequence_active) && id(light_state) == 1 );'
@@ -189,7 +269,7 @@ binary_sensor:
             then:
               - light.turn_on:
                   id: stair_light
-                  effect: "Fade off UP"
+                  effect: "Group Fade off UP"
               - wait_until:
                   condition:
                     lambda: 'return id(effect_finished);'
@@ -204,6 +284,7 @@ binary_sensor:
     on_release:
       then:
         - lambda: 'id(last_pir_cleared_time) = millis();'
+        ## Default Action for turning off the lights going up
         - if:
             condition:
               lambda: 'return (id(up_sequence_active) == true && id(down_sequence_active) == false);'
@@ -214,7 +295,7 @@ binary_sensor:
                   timeout: 30s
               - light.turn_on:
                   id: stair_light
-                  effect: "Fade off UP"
+                  effect: "Group Fade off UP"
               - wait_until:
                   condition:
                     lambda: 'return id(effect_finished);'
@@ -243,6 +324,35 @@ binary_sensor:
       - delayed_off: 200ms # Debounce off    
     on_press:
         then:
+          # Easter egg trigger check
+          - lambda: |
+              if (id(upper_pir_sensor).state) {  // Both PIRs active
+                if (millis() - id(last_disco_trigger_time) < 5000) {
+                  id(disco_trigger_count)++;
+                } else {
+                  id(disco_trigger_count) = 1;  // Reset count if too much time passed
+                }
+                id(last_disco_trigger_time) = millis();
+                if (id(disco_trigger_count) >= 3 && !id(disco_mode_active)) {
+                  id(disco_mode_active) = true;
+                  id(stair_light).turn_on().set_effect("Disco Mode");
+                }
+              }
+          # "Secret Knock" Easter Egg
+          # Trigger: Rapidly trigger the lower PIR sensor 5 times within 3 seconds (like a secret knock).
+          # Effect: Activates a "Fire Flicker" effect that mimics a warm, flickering candlelight glow for 15 seconds.
+          # Purpose: Adds a cozy, mysterious ambiance, perfect for a dramatic stairwell entrance.
+          - lambda: |
+              if (millis() - id(last_knock_time) < 3000) {
+                id(knock_count)++;
+              } else {
+                id(knock_count) = 1;  // Reset if too much time passed
+              }
+              id(last_knock_time) = millis();
+              if (id(knock_count) >= 5) {
+                id(stair_light).turn_on().set_effect("Fire Flicker");
+                id(knock_count) = 0;  // Reset after triggering
+              }
           #- lambda: |-
           #      ESP_LOGD("Global Variables", "PIR Sensor (Lower) before condition");
           #      ESP_LOGD("Global Variables", "light_state: %i", id(light_state));
@@ -252,18 +362,19 @@ binary_sensor:
           #      ESP_LOGD("Global Variables", "last_trigger_time: %li", id(last_trigger_time));
           #      ESP_LOGD("Global Variables", "last_pir_cleared_time: %li", id(last_pir_cleared_time));
           #      ESP_LOGD("Global Variables", "effect_finished: %s", id(effect_finished) ? "true" : "false");
-
-          ## new trigger
+          
+          ## Trigger to test unified fade 
           - if:
               condition:
                 and:
                   - lambda: 'return ((!id(up_sequence_active) && !id(down_sequence_active)) || (!id(down_sequence_active) && id(light_state) == 0));'
-                  #- lambda: 'return id(last_pir) == 1 && (millis() - id(last_trigger_time)) < 5000;'
-                  #- binary_sensor.is_on: lower_pir_sensor
               then:
+                - lambda: |
+                    id(fade_direction_up) = true;  // Up
+                    id(fade_on) = true;            // On (white)
                 - light.turn_on:
                     id: stair_light
-                    effect: "Fade on UP"
+                    effect: "Fade Control"
                 - wait_until:
                     condition:
                       lambda: 'return id(effect_finished);'
@@ -273,8 +384,27 @@ binary_sensor:
                     id(last_trigger_time) = millis();
                     id(last_pir) = 1;
                     id(light_state) = 1;
-                #- delay: 6s
-          ## same trigger going up half way then back down 
+          
+          ## Default Action for Going Up
+          #- if:
+          #    condition:
+          #      and:
+          #        - lambda: 'return ((!id(up_sequence_active) && !id(down_sequence_active)) || (!id(down_sequence_active) && id(light_state) == 0));'
+          #    then:
+          #      - light.turn_on:
+          #          id: stair_light
+          #          effect: "Group Fade on UP"
+          #      - wait_until:
+          #          condition:
+          #            lambda: 'return id(effect_finished);'
+          #      - lambda: |
+          #          id(up_sequence_active) = true;
+          #          id(effect_finished) = false;
+          #          id(last_trigger_time) = millis();
+          #          id(last_pir) = 1;
+          #          id(light_state) = 1;
+
+          ## Default Action for turning halfway and going back Down 
           - if:
               condition:
                 and:
@@ -287,7 +417,7 @@ binary_sensor:
               then:
                 - light.turn_on:
                     id: stair_light
-                    effect: "Fade off Down"
+                    effect: "Group Fade off Down"
                 - wait_until:
                     condition:
                       lambda: 'return id(effect_finished);'
@@ -301,6 +431,7 @@ binary_sensor:
     on_release:
       then:
         - lambda: 'id(last_pir_cleared_time) = millis();'
+        ## Default Action for turning off the lights going Down
         - if:
             condition:
               lambda: 'return (id(down_sequence_active) == true && id(up_sequence_active) == false);'
@@ -311,7 +442,7 @@ binary_sensor:
                   timeout: 30s
               - light.turn_on:
                   id: stair_light
-                  effect: "Fade off Down"
+                  effect: "Group Fade off Down"
               - wait_until:
                   condition:
                     lambda: 'return id(effect_finished);'
@@ -331,6 +462,28 @@ binary_sensor:
 #    60 seconds have passed since last trigger
 #    Both PIRs are off
 interval:
+  # Moonlight Mode" Easter Egg
+  # Trigger: Hold both PIR sensors active for 10 seconds (e.g., by standing still in range of both).
+  # Effect: Activates a gentle, pulsing blue "Moonlight" effect for 30 seconds, simulating moonlight on the stairs.
+  # Purpose: Creates a calming, nighttime aesthetic.
+  - interval: 1s
+    then:
+      - if:
+          condition:
+            and:
+              - binary_sensor.is_on: upper_pir_sensor
+              - binary_sensor.is_on: lower_pir_sensor
+          then:
+            - lambda: |
+                if (id(both_pir_start_time) == 0) {
+                  id(both_pir_start_time) = millis();
+                }
+                if (millis() - id(both_pir_start_time) > 10000) {
+                  id(stair_light).turn_on().set_effect("Moonlight");
+                  id(both_pir_start_time) = 0;  // Reset after triggering
+                }
+          else:
+            - lambda: 'id(both_pir_start_time) = 0;'
   - interval: 10s
     then:
       - lambda: |-
@@ -575,16 +728,18 @@ light:
             id(effect_finished) = effect_complete;
 
       - addressable_lambda:
-          name: "Group Fade on UP"
-          update_interval: 50ms
+          name: "Group Fade on DOWN"
+          update_interval: 150ms
           lambda: |-
-            static const uint16_t GROUP_SIZE = 10;
+            static const uint16_t GROUP_SIZE = 4;
             static ESPHSVColor mColor = ESPHSVColor(255, 0, 250);
             static uint16_t progress = 0;
             static bool effect_complete = false;  // New flag to track completion
 
             if (initial_run) {
               progress = 0;
+              effect_complete = false;
+              it.all() = Color::BLACK;
               return;
             }
 
@@ -596,19 +751,26 @@ light:
                 }
               }
               progress += GROUP_SIZE;
+              effect_complete = false;  // Effect still running
+            } else {
+              effect_complete = true;   // Effect has finished
             }
+            // Expose the completion status to global
+            id(effect_finished) = effect_complete;
+
 
       - addressable_lambda:
-          name: "Group Fade off UP"
-          update_interval: 500ms
+          name: "Group Fade off DOWN"
+          update_interval: 150ms
           lambda: |-
-            static const uint16_t GROUP_SIZE = 10;
+            static const uint16_t GROUP_SIZE = 4;
             static ESPHSVColor mColor = ESPHSVColor(255, 255, 0);
             static uint16_t progress = 0;
             static bool effect_complete = false;  // New flag to track completion
 
             if (initial_run) {
               progress = 0;
+              effect_complete = false;
               return;
             }
 
@@ -620,13 +782,18 @@ light:
                 }
               }
               progress += GROUP_SIZE;
+              effect_complete = false;  // Effect still running
+            } else {
+              effect_complete = true;   // Effect has finished
             }
+            // Expose the completion status to global
+            id(effect_finished) = effect_complete;
 
       - addressable_lambda:
-          name: "Group Fade on Down"
-          update_interval: 50ms
+          name: "Group Fade on UP"
+          update_interval: 150ms
           lambda: |-
-            static const uint16_t GROUP_SIZE = 10;
+            static const uint16_t GROUP_SIZE = 4;
             static const uint16_t GAP_SIZE = 5;
             static ESPHSVColor mColor = ESPHSVColor(255, 0, 250);
             static uint16_t progress = 0;
@@ -634,6 +801,8 @@ light:
 
             if (initial_run) {
               progress = 0;
+              effect_complete = false;
+              it.all() = Color::BLACK;
               return;
             }
 
@@ -646,13 +815,19 @@ light:
               }
               //progress += GROUP_SIZE + GAP_SIZE;
               progress += GROUP_SIZE;
+              effect_complete = false;  // Effect still running
+            } else {
+              effect_complete = true;   // Effect has finished
             }
+            // Expose the completion status to global
+            id(effect_finished) = effect_complete;
+
 
       - addressable_lambda:
-          name: "Group Fade off Down"
-          update_interval: 50ms
+          name: "Group Fade off UP"
+          update_interval: 150ms
           lambda: |-
-            static const uint16_t GROUP_SIZE = 10;
+            static const uint16_t GROUP_SIZE = 4;
             static const uint16_t GAP_SIZE = 5;
             static ESPHSVColor mColor = ESPHSVColor(255, 255, 0);
             static uint16_t progress = 0;
@@ -660,6 +835,7 @@ light:
 
             if (initial_run) {
               progress = 0;
+              effect_complete = false;
               return;
             }
 
@@ -673,7 +849,12 @@ light:
               //progress += GROUP_SIZE + GAP_SIZE;
               progress += GROUP_SIZE;
               //progress -= GROUP_SIZE; // Decrement progress
+              effect_complete = false;  // Effect still running
+            } else {
+              effect_complete = true;   // Effect has finished
             }
+            // Expose the completion status to global
+            id(effect_finished) = effect_complete;
 
       - addressable_lambda:
           name: "Addressable Fade"
@@ -745,3 +926,219 @@ light:
           name: "Pulse"
           transition_length: 0.5s
           update_interval: 0.5s
+
+      # New Easter egg effect 1
+      - addressable_lambda:
+          name: "Disco Mode"
+          update_interval: 200ms
+          lambda: |-
+            static uint8_t hue = 0;
+            static bool initial_run_complete = false;
+            static uint32_t disco_start_time = 0;
+
+            if (initial_run) {
+              hue = 0;
+              initial_run_complete = false;
+              disco_start_time = millis();
+              it.all() = ESPHSVColor(0, 255, 150);
+              return;
+            }
+
+            // Run for 10 seconds then turn off
+            if (millis() - disco_start_time > 10000) {
+              it.all() = Color::BLACK;
+              id(disco_mode_active) = false;
+              id(disco_trigger_count) = 0;
+              id(last_disco_trigger_time) = 0;
+              id(up_sequence_active) = false;
+              id(down_sequence_active) = false;
+              id(light_state) = 0;
+              id(stair_light).turn_off();
+              return;
+            }
+
+            hue += 30;
+            for (int i = 0; i < it.size(); i++) {
+              uint8_t local_hue = (hue + (i * 10)) % 255;
+              it[i] = ESPHSVColor(local_hue, 255, 150);
+            }
+      # New Easter egg effect 2
+      - addressable_lambda:
+          name: "Fire Flicker"
+          update_interval: 100ms
+          lambda: |-
+            static uint32_t start_time = 0;
+            if (initial_run) {
+              start_time = millis();
+              it.all() = ESPHSVColor(20, 255, 100);  // Warm orange base
+              return;
+            }
+            if (millis() - start_time > 15000) {  // Run for 15 seconds
+              it.all() = Color::BLACK;
+              id(stair_light).turn_off();
+              return;
+            }
+            for (int i = 0; i < it.size(); i++) {
+              int flicker = random(0, 50);  // Random brightness variation
+              it[i] = ESPHSVColor(20, 255, 100 + flicker);  // Warm flickering glow
+            }
+      # New Easter egg effect 3
+      - addressable_lambda:
+          name: "Moonlight"
+          update_interval: 500ms
+          lambda: |-
+            static uint32_t start_time = 0;
+            static uint8_t brightness = 50;
+            static bool increasing = true;
+            if (initial_run) {
+              start_time = millis();
+              brightness = 50;
+              increasing = true;
+              return;
+            }
+            if (millis() - start_time > 30000) {  // Run for 30 seconds
+              it.all() = Color::BLACK;
+              id(stair_light).turn_off();
+              return;
+            }
+            if (increasing) {
+              brightness += 10;
+              if (brightness >= 150) increasing = false;
+            } else {
+              brightness -= 10;
+              if (brightness <= 50) increasing = true;
+            }
+            it.all() = ESPHSVColor(220, 255, brightness);  // Soft blue pulsing
+      # Description: A trail of light follows the direction of movement (up or down), with a gentle "breathing" pulse effect at the leading edge.
+      # Use Case: Combines motion tracking with a soothing visual cue.
+      - addressable_lambda:
+          name: "Breathing Trail"
+          update_interval: 100ms
+          lambda: |-
+            static int lead_pos = 0;
+            static uint8_t breathe = 100;
+            static bool increasing = true;
+            static bool going_up = true;
+            if (initial_run) {
+              lead_pos = id(up_sequence_active) ? 0 : it.size() - 1;
+              going_up = id(up_sequence_active);
+              breathe = 100;
+              increasing = true;
+              it.all() = Color::BLACK;
+              return;
+            }
+            it.all() = Color::BLACK;
+            // Breathing effect at lead position
+            if (increasing) {
+              breathe += 20;
+              if (breathe >= 200) increasing = false;
+            } else {
+              breathe -= 20;
+              if (breathe <= 100) increasing = true;
+            }
+            it[lead_pos] = ESPHSVColor(120, 255, breathe);  // Greenish pulse
+            // Trail behind
+            for (int i = 1; i < 5; i++) {
+              int trail_pos = going_up ? lead_pos - i : lead_pos + i;
+              if (trail_pos >= 0 && trail_pos < it.size()) {
+                it[trail_pos] = ESPHSVColor(120, 255, 50);  // Dimmer trail
+              }
+            }
+            if (going_up) {
+              lead_pos++;
+              if (lead_pos >= it.size()) id(effect_finished) = true;
+            } else {
+              lead_pos--;
+              if (lead_pos < 0) id(effect_finished) = true;
+            }
+      # Sescription: Lights up groups of LEDs (e.g., one group per stair) with a soft fade-in/fade-out, creating a clear path visualization.
+      # Use Case: Improves safety by clearly marking each step.
+      - addressable_lambda:
+          name: "Step Highlight"
+          update_interval: 200ms
+          lambda: |-
+            static uint8_t brightness = 0;
+            static bool fading_in = true;
+            const uint16_t leds_per_step = 10;  // Adjust based on your stairs
+            if (initial_run) {
+              brightness = 0;
+              fading_in = true;
+              it.all() = Color::BLACK;
+              return;
+            }
+            if (fading_in) {
+              brightness += 20;
+              if (brightness >= 200) fading_in = false;
+            } else {
+              brightness -= 20;
+              if (brightness <= 0) fading_in = true;
+            }
+            for (int i = 0; i < it.size(); i += leds_per_step) {
+              for (int j = 0; j < leds_per_step && (i + j) < it.size(); j++) {
+                it[i + j] = ESPHSVColor(40, 100, brightness);  // Warm yellow
+              }
+            }
+            id(effect_finished) = false;  // Runs until stopped
+      # Description: A single "wave" of light travels up or down the stairs, bouncing back and forth like a runner, with adjustable speed and color.
+      # Use Case: Highlights motion direction and adds a dynamic, playful touch.
+      - addressable_lambda:
+          name: "Wave Runner"
+          update_interval: 50ms
+          lambda: |-
+            static int position = 0;
+            static bool going_up = true;
+            static ESPHSVColor wave_color = ESPHSVColor(160, 255, 200);  // Cyan
+            if (initial_run) {
+              position = 0;
+              going_up = id(up_sequence_active);  // Direction based on trigger
+              it.all() = Color::BLACK;
+              return;
+            }
+            it.all() = Color::BLACK;  // Clear previous frame
+            it[position] = wave_color;
+            if (going_up) {
+              position++;
+              if (position >= it.size() - 1) going_up = false;
+            } else {
+              position--;
+              if (position <= 0) going_up = true;
+            }
+            id(effect_finished) = false;  // Keep running indefinitely until stopped
+      - addressable_lambda:
+          name: "Fade Control"
+          update_interval: 200ms
+          lambda: |-
+            static uint16_t progress = 0;
+            static bool effect_complete = false;
+            static ESPHSVColor on_color = ESPHSVColor(255, 0, 250);   // White-ish (adjustable)
+            static ESPHSVColor off_color = ESPHSVColor(255, 255, 0);  // Black
+
+            if (initial_run) {
+              progress = 0;
+              effect_complete = false;
+              it.all() = Color::BLACK;  // Clear LEDs on start
+              return;
+            }
+
+            ESPHSVColor target_color = id(fade_on) ? on_color : off_color;
+            uint16_t group_size = id(fade_group_size);
+
+            if (progress < it.size()) {
+              if (id(fade_direction_up)) {
+                // Fade UP
+                for (uint16_t i = 0; i < group_size && (progress + i) < it.size(); i++) {
+                  it[progress + i] = target_color;
+                }
+              } else {
+                // Fade DOWN
+                for (uint16_t i = 0; i < group_size && (it.size() - progress - i - 1) < it.size(); i++) {
+                  it[it.size() - progress - i - 1] = target_color;
+                }
+              }
+              progress += group_size;
+              effect_complete = false;
+            } else {
+              effect_complete = true;
+            }
+
+            id(effect_finished) = effect_complete;

@@ -105,7 +105,7 @@ globals:
   - id: led_group_size
     type: int
     restore_value: yes
-    initial_value: '10' # Default group size - Number of LEDs to light at a time
+    initial_value: '2' # Default group size - Number of LEDs to light at a time
   - id: led_gap_size
     type: int
     restore_value: yes
@@ -585,7 +585,7 @@ light:
     type: GRB
     variant: WS2811
     pin: GPIO4
-    num_leds: 110
+    num_leds: 58
     name: "Stair Light"
     id: "stair_light"
     restore_mode: ALWAYS_OFF
@@ -597,7 +597,7 @@ light:
       - addressable_lambda:
           name: "Fade on DOWN"
           #update_interval: 30ms #15ms is a nice number
-          update_interval: 50ms
+          update_interval: 15ms
           lambda: |-
             //initializes the progress variable to 0. This variable is intended to track which LED is being lit.
             static auto TAG = "Fade on DOWN";
@@ -636,7 +636,7 @@ light:
 
       - addressable_lambda:
           name: "Fade off DOWN"
-          update_interval: 30ms #15ms is a nice number
+          update_interval: 15ms #15ms is a nice number
           lambda: |-
             static auto TAG = "Fade off DOWN";
             static ESPHSVColor mBlack = ESPHSVColor(255, 255, 0);
@@ -670,7 +670,7 @@ light:
 
       - addressable_lambda:
           name: "Fade on UP"
-          update_interval: 30ms #15ms is a nice number
+          update_interval: 15ms #15ms is a nice number
           lambda: |-
             static auto TAG = "Fade on UP";
             static ESPHSVColor mColor = ESPHSVColor(255, 0, 250);
@@ -705,7 +705,7 @@ light:
 
       - addressable_lambda:
           name: "Fade off UP"
-          update_interval: 30ms #15ms is a nice number
+          update_interval: 15ms #15ms is a nice number
           lambda: |-
             static auto TAG = "Fade off UP";
             static ESPHSVColor mBlack = ESPHSVColor(255, 255, 0);
@@ -742,7 +742,8 @@ light:
           name: "Group Fade on DOWN"
           update_interval: 75ms
           lambda: |-
-            static const uint16_t GROUP_SIZE = 4;
+            uint16_t GROUP_SIZE = id(led_group_size);
+            //static const uint16_t GROUP_SIZE = 2;
             static ESPHSVColor mColor = ESPHSVColor(255, 0, 250);
             static uint16_t progress = 0;
             static bool effect_complete = false;  // New flag to track completion
@@ -774,7 +775,8 @@ light:
           name: "Group Fade off DOWN"
           update_interval: 75ms
           lambda: |-
-            static const uint16_t GROUP_SIZE = 4;
+            uint16_t GROUP_SIZE = id(led_group_size);
+            //static const uint16_t GROUP_SIZE = 2;
             static ESPHSVColor mColor = ESPHSVColor(255, 255, 0);
             static uint16_t progress = 0;
             static bool effect_complete = false;  // New flag to track completion
@@ -804,7 +806,8 @@ light:
           name: "Group Fade on UP"
           update_interval: 75ms
           lambda: |-
-            static const uint16_t GROUP_SIZE = 4;
+            uint16_t GROUP_SIZE = id(led_group_size);
+            //static const uint16_t GROUP_SIZE = 2;
             static const uint16_t GAP_SIZE = 5;
             static ESPHSVColor mColor = ESPHSVColor(255, 0, 250);
             static uint16_t progress = 0;
@@ -838,7 +841,8 @@ light:
           name: "Group Fade off UP"
           update_interval: 75ms
           lambda: |-
-            static const uint16_t GROUP_SIZE = 4;
+            uint16_t GROUP_SIZE = id(led_group_size);
+            //static const uint16_t GROUP_SIZE = 2;
             static const uint16_t GAP_SIZE = 5;
             static ESPHSVColor mColor = ESPHSVColor(255, 255, 0);
             static uint16_t progress = 0;
@@ -957,7 +961,7 @@ light:
               return;
             }
             for (int i = 0; i < it.size(); i++) {
-              int flicker = random(0, 50);  // Random brightness variation
+              int flicker = random(0, 100);  // Random brightness variation
               it[i] = ESPHSVColor(20, 255, 100 + flicker);  // Warm flickering glow
             }
       # New Easter egg effect 3
@@ -1085,7 +1089,7 @@ light:
 ## need to find a way to address the update interval better 
       - addressable_lambda:
           name: "Fade Control"
-          update_interval: 200ms
+          update_interval: 100ms #200ms
           lambda: |-
             static uint16_t progress = 0;
             static bool effect_complete = false;
@@ -1121,3 +1125,57 @@ light:
             }
 
             id(effect_finished) = effect_complete;
+
+      - addressable_lambda:
+          name: "Step Forward-Back Pattern"
+          update_interval: 100ms  # Adjust speed here (500ms = 0.5 seconds per step)
+          lambda: |-
+            static int step = 0;           // Overall step counter
+            static int cycle = 0;          // Tracks the cycle within each pattern
+            static int start_pos = 0;      // Starting LED position
+            static int leds_to_light = 1;  // Number of LEDs to light up
+            static bool turning_off = false;  // Flag for turning off phase
+
+            // Clear all LEDs first
+            for (int i = 0; i < it.size(); i++) {
+              it[i] = ESPColor(0, 0, 0);  // Turn off all LEDs
+            }
+
+            // Calculate current position and LEDs to affect
+            int current_pos = start_pos;
+            int end_pos = current_pos + leds_to_light;
+
+            if (end_pos > it.size()) end_pos = it.size();  // Cap at 58 LEDs
+
+            if (!turning_off) {
+              // Turning on phase
+              for (int i = current_pos; i < end_pos && i < it.size(); i++) {
+                it[i] = ESPColor(255, 255, 255);  // White light
+              }
+              cycle++;
+              if (cycle >= leds_to_light) {
+                turning_off = true;  // Switch to turning off phase
+                cycle = 0;
+              }
+            } else {
+              // Turning off phase (reverse order)
+              int off_count = leds_to_light - cycle - 1;
+              for (int i = current_pos; i < end_pos - off_count && i < it.size(); i++) {
+                it[i] = ESPColor(255, 255, 255);  // Keep earlier LEDs on
+              }
+              cycle++;
+              if (cycle >= leds_to_light - 1) {
+                // Finished turning off, move to next pattern
+                turning_off = false;
+                cycle = 0;
+                start_pos++;
+                leds_to_light++;
+                if (start_pos >= it.size() || leds_to_light > it.size()) {
+                  // Reset to start when reaching the end
+                  start_pos = 0;
+                  leds_to_light = 1;
+                }
+              }
+            }
+
+            step++;  // Increment overall step for timing

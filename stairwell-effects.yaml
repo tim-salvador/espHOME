@@ -154,6 +154,18 @@ sensor:
     unit_of_measurement: ""
     icon: "mdi:disco"
 
+  - platform: dht
+    model: DHT11
+    pin: GPIO0
+    temperature:
+      name: "Stair Light Enclosure Temperature"
+      filters:
+        - lambda: return x * (9.0/5.0) + 32.0;
+      unit_of_measurement: "°F"
+    humidity:
+      name: "Stair Light Enclosure Humidity"
+    update_interval: 60s
+
 ## Ambient Light Sensor
 #sensor:
 #  - platform: bh1750

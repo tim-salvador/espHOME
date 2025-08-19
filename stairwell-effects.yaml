@@ -57,7 +57,7 @@ globals:
     type: int
     restore_value: no
     initial_value: '0' # 0 = off, 1 = low to high, 2 = high to low
-# used to track direction
+  # used to track direction
   - id: up_sequence_active
     type: bool
     initial_value: 'false'
@@ -71,8 +71,7 @@ globals:
     type: int
     restore_value: no
     initial_value: '0'
-
-# Used to track last triggered 
+  # Used to track last triggered 
   - id: last_trigger_time
     type: long
     initial_value: '0'
@@ -82,7 +81,7 @@ globals:
   - id: effect_finished  # New global to track effect completion
     type: bool
     initial_value: 'false'
-# Added globals for Easter egg
+  # Added globals for Easter egg
   - id: disco_trigger_count
     type: int
     initial_value: '0'
@@ -122,8 +121,6 @@ globals:
     type: int
     restore_value: yes
     initial_value: '9'  # needs to be be grouping with no remainders.  1,2,3,4,6,9,12
-
-## Would like to add a system status that encorporates multiple globals.  for example
   - id: system_state
     type: int
     initial_value: '0'  # 0 = idle, 1 = up_active, 2 = down_active, 3 = cooling_down
@@ -134,6 +131,7 @@ globals:
 #      id(last_trigger_time) = millis();
 #      id(system_state) = 1;       // Up active
 #    }
+
 
 # HA tracking
 sensor:
@@ -172,10 +170,17 @@ sensor:
       name: "Stair Light Enclosure Temperature"
       filters:
         - lambda: return x * (9.0/5.0) + 32.0;
+        - offset: 8.0 # adds 8 degrees to the reading
       unit_of_measurement: "°F"
     humidity:
       name: "Stair Light Enclosure Humidity"
     update_interval: 60s
+
+  - platform: homeassistant
+  # pull the illuminance value from sensor.hue_motion_sensor_1_illuminance
+    id: hue_illuminance
+    entity_id: sensor.hue_motion_sensor_1_illuminance
+    internal: True # only exploses entity to esp
 #  - platform: homeassistant # tells ESPHome to use the homeassistant.
 #    device: bh-1750-light-sensor # The hostname of your ESP32 device
 #    id: remote_light_sensor
@@ -202,8 +207,25 @@ sensor:
 #              id(stair_light).turn_on().set_brightness(0.4);
 #            }
 
-
-
+text_sensor:
+  # template sensor to evaluate the illuminance value and display the appropriate text. 
+  # This sensor will read the hue_illuminance sensor and output a string.
+  - platform: template
+    name: "Light Status"
+    id: light_status_text
+    # reads the state of the hue_illuminance sensor and returns a string based on the conditional statements
+    # use the return {}; syntax with a value inside the curly braces. This converts the C-style string into the expected optional<string> type
+    lambda: |-
+      float illuminance = id(hue_illuminance).state;
+      std::string status;
+      if (illuminance > 90.0) {
+        status = "way to sunny";
+      } else if (illuminance > 70.0) {
+        status = "light is on";
+      } else {
+        status = "light is off";
+      }
+      return {to_string(illuminance) + " lux (" + status + ")"};
 
 number:
   - platform: template
@@ -216,6 +238,13 @@ number:
     optimistic: true
     set_action:
       - lambda: 'id(led_group_size) = x;'
+
+
+output:
+  - platform: esp8266_pwm
+    id: storage_output
+    pin: GPIO5
+
 
 binary_sensor:
   - platform: gpio
@@ -239,7 +268,6 @@ binary_sensor:
     on_release:
       - light.turn_off: Storage_light
 
-
   - platform: gpio
     pin:
       number: 12
@@ -248,8 +276,8 @@ binary_sensor:
     name: "PIR Sensor (Upper)"
     id: upper_pir_sensor
     filters:
-      - delayed_on: 100ms  # Debounce on
-      - delayed_off: 200ms # Debounce off    
+      - delayed_on: 80ms #100ms  # Debounce on
+      - delayed_off: 100ms # Debounce off    
     device_class: motion
     on_press:
       then:
@@ -371,7 +399,7 @@ binary_sensor:
     id: lower_pir_sensor
     device_class: motion
     filters:
-      - delayed_on: 100ms  # Debounce on
+      - delayed_on: 80ms #100ms  # Debounce on
       - delayed_off: 200ms # Debounce off    
     on_press:
         then:
@@ -624,20 +652,32 @@ interval:
 wled:
 
 light:
-#  - platform: monochromatic
-#    id: "under_stair_storage"
-#    name: "Under Stair Storage"
-#    output: under_stair_storage_output
-
-  - platform: neopixelbus
-    type: GRB
-    variant: WS2811
-    pin: GPIO5
-    num_leds: 2
-    name: "Storage Light"
+  # Storage Lights
+  #  - platform: neopixelbus
+  #    type: GRB
+  #    variant: WS2811
+  #    pin: GPIO5
+  #    num_leds: 60
+  #    name: "Storage Light"
+  #    id: "Storage_light"
+  #    restore_mode: ALWAYS_OFF
+  - platform: monochromatic
+    #MOSFET: The MOSFET acts as the switch. (IRF520, IRLZ44N, IRF540, IRLB8721).
+    # GPIO5 to gate
+    #Connect the MOSFET's Source pin to the GND of both the ESP8266 and the 12V power supply. This creates a common ground.
+    # negative (-) wire of the LED strip to the Drain pin of the MOSFET.
+    #12V Power Supply:
+    #positive (+) terminal of the 12V power supply to the positive wire of the LED strip.
+    #negative (-) terminal of the 12V power supply to the Source of the MOSFET.
+    #When the ESP8266's GPIO5 goes high, it "opens" the MOSFET, allowing current to flow from the LED strip's negative wire through the MOSFET to the common ground, completing the circuit and turning the lights on.
+    # pin 1 - source, pin 2 - gate, pin 3 - drain
     id: "Storage_light"
-    restore_mode: ALWAYS_OFF
+    name: "Storage Light"
+    output: storage_output
 
+
+
+# Stair lights
   - platform: neopixelbus
     type: BRG
     variant: WS2811
@@ -685,8 +725,6 @@ light:
               effect_complete = true;
             }
             id(effect_finished) = effect_complete;
-
-
       - addressable_lambda:
           name: "Fade off DOWN"
           update_interval: 15ms #15ms is a nice number
@@ -720,7 +758,6 @@ light:
               effect_complete = true;
             }
             id(effect_finished) = effect_complete;
-
       - addressable_lambda:
           name: "Fade on UP"
           update_interval: 15ms #15ms is a nice number
@@ -755,7 +792,6 @@ light:
             };
             // Expose the completion status to global
             id(effect_finished) = effect_complete;
-
       - addressable_lambda:
           name: "Fade off UP"
           update_interval: 15ms #15ms is a nice number
@@ -790,10 +826,9 @@ light:
             }
             // Expose the completion status to global
             id(effect_finished) = effect_complete;
-
       - addressable_lambda:
           name: "Group Fade on DOWN"
-          update_interval: 75ms
+          update_interval: 50ms
           lambda: |-
             uint16_t GROUP_SIZE = id(led_group_size);
             //static const uint16_t GROUP_SIZE = 2;
@@ -822,11 +857,9 @@ light:
             }
             // Expose the completion status to global
             id(effect_finished) = effect_complete;
-
-
       - addressable_lambda:
           name: "Group Fade off DOWN"
-          update_interval: 75ms
+          update_interval: 50ms
           lambda: |-
             uint16_t GROUP_SIZE = id(led_group_size);
             //static const uint16_t GROUP_SIZE = 2;
@@ -854,10 +887,9 @@ light:
             }
             // Expose the completion status to global
             id(effect_finished) = effect_complete;
-
       - addressable_lambda:
           name: "Group Fade on UP"
-          update_interval: 75ms
+          update_interval: 50ms
           lambda: |-
             uint16_t GROUP_SIZE = id(led_group_size);
             //static const uint16_t GROUP_SIZE = 2;
@@ -888,11 +920,9 @@ light:
             }
             // Expose the completion status to global
             id(effect_finished) = effect_complete;
-
-
       - addressable_lambda:
           name: "Group Fade off UP"
-          update_interval: 75ms
+          update_interval: 50ms
           lambda: |-
             uint16_t GROUP_SIZE = id(led_group_size);
             //static const uint16_t GROUP_SIZE = 2;
@@ -923,8 +953,6 @@ light:
             }
             // Expose the completion status to global
             id(effect_finished) = effect_complete;
-
-
       - addressable_color_wipe:
           name: forward wipe
           colors:
@@ -961,7 +989,6 @@ light:
           name: "Pulse"
           transition_length: 0.5s
           update_interval: 0.5s
-
       # New Easter egg effect 1
       - addressable_lambda:
           name: "Disco Mode"
@@ -1139,7 +1166,7 @@ light:
               if (position <= 0) going_up = true;
             }
             id(effect_finished) = false;  // Keep running indefinitely until stopped
-## need to find a way to address the update interval better 
+      ## need to find a way to address the update interval better 
       - addressable_lambda:
           name: "Fade Control"
           update_interval: 100ms #200ms
@@ -1178,7 +1205,6 @@ light:
             }
 
             id(effect_finished) = effect_complete;
-
       - addressable_lambda:
           name: "Step Forward-Back Pattern"
           update_interval: 100ms  # Adjust speed here (500ms = 0.5 seconds per step)
@@ -1234,13 +1260,15 @@ light:
             step++;  // Increment overall step for timing
       - addressable_lambda:
           name: "Fade Control V2"
-          update_interval: 180ms
+          update_interval: 140ms
           lambda: |-
             static uint16_t progress = 0;
             static bool effect_complete = false;
-            static ESPHSVColor on_color = ESPHSVColor(255, 0, 170);    // White-ish (adjustable)
+            //static ESPHSVColor on_color = ESPHSVColor(255, 0, 170);    // White-ish (adjustable)
+            static ESPHSVColor blue_color = ESPHSVColor(255, 0, 170);    // White-ish (adjustable)
             static ESPHSVColor off_color = ESPHSVColor(255, 255, 0);   // Black
-            static ESPHSVColor blue_color = ESPHSVColor(160, 255, 170); // Blue (H:160°, S:100%, V:67%)
+            //static ESPHSVColor blue_color = ESPHSVColor(160, 255, 170); // Blue (H:160°, S:100%, V:67%)
+            static ESPHSVColor on_color = ESPHSVColor(160, 255, 255); // Blue (H:160°, S:100%, V:67%)
             static ESPHSVColor red_color = ESPHSVColor(240, 255, 170); // Blue (H:240°, S:100%, V:67%)
 
             if (initial_run) {

@@ -1,0 +1,490 @@
+substitutions:
+  device_name: wrover-assistant
+  friendly_name: 'Wrover Voice Satellite'
+  led_pwr_factor: '0.3' # 0 - 1 (My LED-strip draws too much power.)
+  led_addressable: 'true' # true / false.
+  led_num: '35' # Number of LEDs
+  error_phase: 'Error'
+  idle_phase: 'Idle'
+  listening_phase: 'Listening'
+  thinking_phase: 'Thinking'
+  replying_phase: 'Replying'
+  not_ready_phase: 'Not Ready'
+  muted_phase: 'Mic Muted'
+  config_volume: '0'
+  config_brightness: '1'
+  config_timeout: '5s'
+
+globals:
+  - id: 'use_wake_word_forced_off'
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+
+  on_boot:
+    priority: 600
+    then:
+      - text_sensor.template.publish:
+          id: va_state
+          state: "not_ready_phase"
+
+esp32:
+  board: esp-wrover-kit
+  framework:
+    type: esp-idf
+    # enables PSRAM under ESPHome's ESP-IDF backend and lets the system allocate buffers into external RAM (PSRAM).
+    sdkconfig_options:
+      CONFIG_SPIRAM_SUPPORT: y
+      CONFIG_ESP32_SPIRAM_SUPPORT: y
+      CONFIG_SPIRAM_USE_CAPS_ALLOC: y
+      CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY: y
+      CONFIG_SPIRAM_USE_MALLOC: y
+      CONFIG_SPIRAM_BOOT_INIT: y
+      CONFIG_SPIRAM_MEMTEST: n
+
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret wrover-api
+
+ota:
+  - platform: esphome
+    password: !secret wrover-ota 
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Wrover-Assistant"
+    password: "7bgAtUFIzxua"
+  domain: !secret local_domain 
+
+mdns:
+  disabled: True
+
+captive_portal:
+
+web_server:
+  version: 2
+
+# Enable logging
+logger:
+  level: INFO # Reduced to lower CPU load
+
+# I2S Audio configuration for microphone and MAX98357A
+# WS for INMP441, LRC for MAX98357A
+# SCK for INMP441, BCLK for MAX98357A
+#MAX98357A: VIN to 3.3V or 5V (pref 5V for louder output), GND shared. BCLK to GPIO26, LRC to GPIO25, DIN to GPIO27. SD pin floating (or pulled high to enable amp—don't ground it). GAIN pin: Floating = 9dB default; tie to GND for lower gain if distortion occurs.
+#INMP441: VDD to 3.3V, GND shared, L/R to GND (left channel), SD to GPIO33, WS to GPIO12, SCK to GPIO14.
+
+i2s_audio:
+  - id: i2s_bus
+    i2s_lrclk_pin: GPIO25 
+    i2s_bclk_pin: GPIO26
+  - id: i2s_bus_in
+    i2s_lrclk_pin: GPIO12 
+    i2s_bclk_pin: GPIO14 
+# Microphone configuration for INMP441
+microphone:
+  - platform: i2s_audio
+    id: mic_inmp441
+    i2s_audio_id: i2s_bus_in
+    i2s_din_pin: GPIO33 # SD for INMP441
+    adc_type: external
+    pdm: false
+    bits_per_sample: 16bit #doesn't work when set to 32bit
+    channel: left
+    i2s_mode: primary
+
+#speaker:
+#  - platform: i2s_audio
+#    id: max_speaker
+#    i2s_audio_id: i2s_bus
+#    i2s_dout_pin: GPIO27
+#    dac_type: external
+#    buffer_duration: 50ms
+#    bits_per_sample: 16bit #doesn't work when set to 32bit
+#    channel: mono
+    #i2s_mode: primary
+#    use_apll: False
+speaker:
+  - platform: i2s_audio
+    id: max_speaker
+    i2s_audio_id: i2s_bus
+    dac_type: external
+    buffer_duration: 150ms
+    i2s_dout_pin: GPIO27
+    bits_per_sample: 16bit #doesn't work when set to 32bit
+    sample_rate: 16000
+    use_apll: False
+  - platform: mixer
+    id: mixer_max_speaker
+    output_speaker: max_speaker
+    source_speakers:
+      - id: announcement_spk_mixer_input
+      - id: media_spk_mixer_input
+  - platform: resampler
+    id: media_spk_resampling_input
+    output_speaker: media_spk_mixer_input
+  - platform: resampler
+    id: announcement_spk_resampling_input
+    output_speaker: announcement_spk_mixer_input
+
+#media_player:
+#  - platform: speaker
+#    name: "Media Player"
+#    id: max_media_player
+#    #codec_support_enabled: false
+#    announcement_pipeline:
+#        speaker: max_speaker
+#        format: WAV
+#        sample_rate: 16000
+#        num_channels: 1
+#    files:
+#      - id: alarm_sound
+#        file: "beep.wav"
+
+media_player:
+  - platform: speaker
+    name: "Media Player"
+    id: max_media_player
+    media_pipeline:
+        speaker: media_spk_resampling_input
+        num_channels: 1
+        sample_rate: 16000
+    announcement_pipeline:
+        speaker: announcement_spk_resampling_input
+        num_channels: 1
+        sample_rate: 16000
+    files:
+      - id: alarm_sound
+        file: "beep.wav" # Placed in the yaml directory. Should be encoded with a 48000 Hz sample rate, mono or stereo audio, and 16 bits per sample.
+
+
+# Voice Assistant configuration
+voice_assistant:
+  id: va
+  microphone: mic_inmp441
+  speaker: max_speaker
+#  media_player: max_media_player # Change to max_media_player for MAX98357A
+  noise_suppression_level: 2
+  volume_multiplier: 4.0
+  auto_gain: 31dBFS
+  use_wake_word: false
+  on_wake_word_detected:
+      - media_player.speaker.play_on_device_media_file:
+          media_file: alarm_sound
+          announcement: true
+
+  on_listening:
+    - light.turn_on:
+        id: va_led
+    - text_sensor.template.publish:
+        id: va_state
+        state: "listening"
+        #state: "${listening_phase}"
+
+  on_stt_vad_start:
+    - text_sensor.template.publish:
+        id: va_state
+        state: "processing"
+
+  on_stt_vad_end:
+    - text_sensor.template.publish:
+        id: va_state
+        state: "${thinking_phase}"
+    #- script.execute: sound_beep
+    #- delay: 160ms
+    #- script.execute: sound_beep
+
+ # on_tts_stream_start:
+ #   - text_sensor.template.publish:
+ #       id: va_state
+ #       state: "replying"
+#        #state: "${replying_phase}"
+  on_tts_stream_start:
+    - text_sensor.template.publish:
+        id: va_state
+        state: "replying"
+
+  on_tts_start:
+    - light.turn_on:
+        id: va_led
+    - text_sensor.template.publish:
+        id: va_state
+        state: "speaking"
+
+  on_tts_stream_end:
+    - script.execute: stop_listening
+
+  on_end:
+    - light.turn_off:
+        id: va_led
+    - text_sensor.template.publish:
+        id: va_state
+        state: "idle"
+  
+  on_error:
+    - if:
+        condition:
+          switch.is_on: use_wake_word
+        then:
+          - switch.turn_off: use_wake_word
+          - switch.turn_on: use_wake_word
+  on_client_connected:
+    - if:
+        condition:
+          switch.is_on: use_wake_word
+        then:
+          - voice_assistant.start_continuous:
+  on_client_disconnected:
+    - if:
+        condition:
+          switch.is_on: use_wake_word
+        then:
+          - voice_assistant.stop:
+
+# Volume control buttons
+button:
+  - platform: template
+    name: "Increase Volume"
+    id: increase_volume
+    on_press:
+      - media_player.volume_up:
+          id: max_media_player # Change to max_media_player for MAX98357A
+  - platform: template
+    name: "Decrease Volume"
+    id: decrease_volume
+    on_press:
+      - media_player.volume_down:
+          id: max_media_player # Change to max_media_player for MAX98357A
+  - platform: template
+    name: "Start Voice Assistant"
+    id: start_va
+    on_press:
+      - voice_assistant.start:
+          id: va
+
+  - platform: template
+    name: "Play sound clip from Web"
+    on_press:
+      then:
+        - media_player.play_media:
+            id: max_media_player
+            media_url: "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3"
+
+  - platform: template
+    name: "Stop VA do something then start it"
+    on_press:
+      then:
+        - if:
+            condition:
+              voice_assistant.is_running:
+            then:
+              - voice_assistant.stop:
+              - delay: 500ms
+        - script.execute: play_1khz_tone
+        - delay: 500ms
+        - if:
+            condition:
+              switch.is_on: use_wake_word
+            then:
+              - voice_assistant.start_continuous:
+  
+  - platform: template
+    name: "Play beep.wav"
+    id: play_beep_wav
+    on_press:
+      then:
+        - media_player.speaker.play_on_device_media_file:
+            media_file: alarm_sound
+            announcement: true
+            
+  - platform: template
+    name: "Play 1kHz Test Tone (Raw)"
+    on_press:
+      then:
+        - script.execute: play_1khz_tone
+
+# API connection status
+binary_sensor:
+  - platform: status
+    name: "API Connection"
+    id: api_connection
+    filters:
+      - delayed_on: 1s
+    on_press:
+      - if:
+          condition:
+            switch.is_on: use_wake_word
+          then:
+            - voice_assistant.start_continuous:
+    on_release:
+      - if:
+          condition:
+            switch.is_on: use_wake_word
+          then:
+            - voice_assistant.stop:
+
+# Switches
+switch:
+  - platform: template
+    name: "Use Wake Word"
+    id: use_wake_word
+    icon: 'mdi:chat-sleep'
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON  # was/  restore_mode: RESTORE_DEFAULT_OFF
+    entity_category: config
+    on_turn_on:
+      - lambda: id(va).set_use_wake_word(true);
+      - if:
+          condition:
+            not:
+              - voice_assistant.is_running
+          then:
+            - voice_assistant.start_continuous
+            - text_sensor.template.publish:
+                id: va_state
+                state: "idle_phase"
+    on_turn_off:
+      - voice_assistant.stop
+      - lambda: id(va).set_use_wake_word(false);
+      - text_sensor.template.publish:
+          id: va_state
+          state: "muted_phase"
+
+  - platform: template
+    name: "Microphone Mute"
+    id: mic_mute
+    optimistic: true
+    turn_on_action:
+      - voice_assistant.stop:
+    turn_off_action:
+      - voice_assistant.start:
+
+  - platform: template
+    name: "play web radio"
+    id: webradio
+    optimistic: true
+    on_turn_on: 
+      then:
+        - script.execute: play_defcon_radio
+    on_turn_off: 
+      then:
+        - media_player.stop: max_media_player
+
+  - platform: template
+    name: "Ring Timer"
+    id: timer_ringing
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    on_turn_off:
+        # Stop playing the alarm
+        - media_player.stop:
+            announcement: true
+        - mixer_speaker.apply_ducking:  # Stop ducking the media stream over 2 seconds
+            id: media_spk_mixer_input
+            decibel_reduction: 0
+            duration: 2.0s
+    on_turn_on:
+        # Duck media audio by 20 decibels instantly
+        - mixer_speaker.apply_ducking:
+            id: media_spk_mixer_input
+            decibel_reduction: 20
+            duration: 0.0s
+        - while:
+            condition:
+                switch.is_on: timer_ringing
+            then:
+                # Play the alarm sound as an announcement
+                - media_player.speaker.play_on_device_media_file:
+                    media_file: alarm_sound
+                    announcement: true
+                # Wait until the alarm sound starts playing
+                - wait_until:
+                    media_player.is_announcing:
+                # Wait until the alarm sound stops playing
+                - wait_until:
+                    not:
+                      media_player.is_announcing:
+
+
+
+# LED for voice assistant status
+output:
+  - platform: gpio
+    pin: GPIO2
+    id: status_led
+
+light:
+  - platform: binary
+    name: "Voice Assistant Status LED"
+    output: status_led
+    id: va_led
+
+# Voice assistant state sensor
+text_sensor:
+  - platform: template
+    name: "Voice Assistant State"
+    id: va_state
+    update_interval: 1s
+
+script:
+  - id: stop_listening
+    then:
+      - if:
+          condition:
+            switch.is_on: use_wake_word
+          then:
+            - text_sensor.template.publish:
+                id: va_state
+                state: "idle_phase"
+          else:
+            - if:
+                condition:
+                  lambda: "return(id(use_wake_word_forced_off));"
+                then:
+                  - switch.template.publish:
+                      id: use_wake_word
+                      state: ON
+                  - lambda: "id(use_wake_word_forced_off) = false;"
+                  - text_sensor.template.publish:
+                      id: va_state
+                      state: "idle_phase"
+                else:
+                  - text_sensor.template.publish:
+                      id: va_state
+                      state: "muted_phase"
+
+  - id: play_defcon_radio
+    mode: restart
+    then:
+      - media_player.play_media:
+          id: max_media_player
+          media_url: "http://ice6.somafm.com/defcon-128-mp3"
+          #media_url: "http://hi5.streamguys.com:8000/live"
+
+
+  - id: play_1khz_tone
+    then:
+      - speaker.play:
+          id: media_spk_mixer_input
+          data: !lambda |-
+            std::vector<uint8_t> bytes;
+            const int num_samples = 8000;
+            for (int i = 0; i < num_samples; ++i) {
+              float t = i / 16000.0f;
+              int16_t sample = static_cast<int16_t>(sin(2 * M_PI * 1000.0f * t) * 12000);
+              bytes.push_back(static_cast<uint8_t>(sample & 0xFF));
+              bytes.push_back(static_cast<uint8_t>((sample >> 8) & 0xFF));
+            }
+            return bytes;

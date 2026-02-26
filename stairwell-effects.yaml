@@ -1,3 +1,34 @@
+# ==============================================================
+# Stairwell Effects - ESPHome Configuration
+# Version 2.0
+#
+# Changes from v1:
+#   - FIXED: All time globals changed from `long` to `uint32_t`
+#             (prevents millis() rollover bugs at ~25 day uptime)
+#   - FIXED: on_release wait_until(is_off) was a no-op; replaced
+#             with configurable fade_off_delay_ms
+#   - FIXED: system_state = 1 after up fade-off was wrong; now 0
+#   - FIXED: Easter eggs can now overlap; added special_effect_active
+#             mutex to prevent simultaneous triggering
+#   - CHANGED: Removed up_sequence_active and down_sequence_active
+#               booleans; all state now unified into system_state
+#               (0=idle, 1=up_active, 2=down_active)
+#   - CHANGED: Removed redundant light_state global; system_state==0
+#               now means idle/off
+#   - NEW: Color preset select entity (Warm White, Cool Blue,
+#           Sunset Orange, Forest Green, Purple Haze, Custom)
+#   - NEW: Platform color preset select (section 2+3 color)
+#   - NEW: Custom color sliders (Hue, Saturation, Brightness)
+#   - NEW: Effect speed control (1-5, runtime frame-skip)
+#   - NEW: Illuminance gating switch + threshold number
+#   - NEW: Configurable light timeout (HA number entity)
+#   - NEW: Configurable fade-off delay (HA number entity)
+#   - NEW: Configurable dwell time after fade-off (HA number entity)
+#   - NOTE: GPIO0 is the ESP8266 boot pin. DHT11 on GPIO0 risks
+#            pulling it low at power-on and entering flash mode.
+#            Consider moving to a safe pin with hardware changes.
+# ==============================================================
+
 esphome:
   name: stairwell-effects
   friendly_name: stairwell_effects
@@ -7,13 +38,18 @@ esphome:
       - light.turn_off: stair_light
       - lambda: |
           id(system_state) = 0;
-          id(up_sequence_active) = false;
-          id(down_sequence_active) = false;
           id(effect_finished) = false;
           id(last_trigger_time) = 0;
           id(last_pir) = 0;
+          id(disco_mode_active) = false;
+          id(disco_trigger_count) = 0;
+          id(last_disco_trigger_time) = 0;
+          id(knock_count) = 0;
+          id(last_knock_time) = 0;
+          id(both_pir_start_time) = 0;
+          id(special_effect_active) = false;
 
-sun: 
+sun:
   latitude: 41.9472
   longitude: 87.7468
 
@@ -24,16 +60,12 @@ time:
 esp8266:
   board: esp01_1m
 
-# Enable logging
 logger:
-  #level: VERBOSE
-  #level: DEBUG
-  #level: ERROR
+  # level: DEBUG
+
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
-
-  # Enable fallback hotspot (captive portal) in case wifi connection fails
   ap:
     ssid: "Stairwell-Effects"
     password: !secret sw_effect_ap_pass
@@ -51,89 +83,150 @@ ota:
 web_server:
   version: 3
 
+# ==============================================================
+# GLOBALS
+# ==============================================================
 globals:
-  ## need to clean up the globals
-  - id: light_state
+  # ---- State Tracking ----
+  - id: system_state
     type: int
-    restore_value: no
-    initial_value: '0' # 0 = off, 1 = low to high, 2 = high to low
-  # used to track direction
-  - id: up_sequence_active
-    type: bool
-    initial_value: 'false'
-  - id: down_sequence_active
-    type: bool
-    initial_value: 'false'
+    initial_value: '0'
+    # 0 = idle, 1 = up_active, 2 = down_active
   - id: last_pir
     type: int
-    initial_value: '0'  # 0 = none, 1 = lower PIR, 2 = upper PIR
+    initial_value: '0'
+    # 0 = none, 1 = lower PIR, 2 = upper PIR
   - id: progress
     type: int
     restore_value: no
     initial_value: '0'
-  # Used to track last triggered 
-  - id: last_trigger_time
-    type: long
-    initial_value: '0'
-  - id: last_pir_cleared_time
-    type: long
-    initial_value: '0'
-  - id: effect_finished  # New global to track effect completion
+  - id: effect_finished
     type: bool
     initial_value: 'false'
-  # Added globals for Easter egg
-  - id: disco_trigger_count
-    type: int
+  - id: fade_direction_up
+    type: bool
+    initial_value: 'true'
+  - id: fade_on
+    type: bool
+    initial_value: 'true'
+  - id: special_effect_active   # Mutex: prevents simultaneous easter eggs
+    type: bool
+    initial_value: 'false'
+
+  # ---- Time Tracking (FIXED: uint32_t prevents millis() rollover at ~25 days) ----
+  - id: last_trigger_time
+    type: uint32_t
+    initial_value: '0'
+  - id: last_pir_cleared_time
+    type: uint32_t
     initial_value: '0'
   - id: last_disco_trigger_time
-    type: long
+    type: uint32_t
+    initial_value: '0'
+  - id: last_knock_time
+    type: uint32_t
+    initial_value: '0'
+  - id: both_pir_start_time
+    type: uint32_t
+    initial_value: '0'
+
+  # ---- LED Layout ----
+  - id: led_gap_size
+    type: int
+    restore_value: yes
+    initial_value: '5'
+  - id: led_group_size
+    type: int
+    restore_value: yes
+    initial_value: '2'
+  - id: led_platform_group_size
+    type: int
+    restore_value: yes
+    initial_value: '9'   # Must divide evenly into 36 (sec 2+3 size)
+
+  # ---- Easter Egg State ----
+  - id: disco_trigger_count
+    type: int
     initial_value: '0'
   - id: disco_mode_active
     type: bool
     initial_value: 'false'
-  # Easter Egg 2
   - id: knock_count
     type: int
     initial_value: '0'
-  - id: last_knock_time
-    type: long
-    initial_value: '0'
-  # Easter Egg 3
-  - id: both_pir_start_time
-    type: long
-    initial_value: '0'
-  # used for unification of fade actions
-  - id: fade_direction_up
-    type: bool
-    initial_value: 'true'  # true = up, false = down
-  - id: fade_on
-    type: bool
-    initial_value: 'true'  # true = on (white), false = off (black)
-  - id: led_gap_size
-    type: int
-    restore_value: yes
-    initial_value: '5' # Default gap size
-  - id: led_group_size
-    type: int
-    restore_value: yes
-    initial_value: '2'  # Default group size for sections 1 and 4
-  - id: led_platform_group_size
-    type: int
-    restore_value: yes
-    initial_value: '9'  # needs to be be grouping with no remainders.  1,2,3,4,6,9,12
-  - id: system_state
-    type: int
-    initial_value: '0'  # 0 = idle, 1 = up_active, 2 = down_active, 3 = cooling_down
-## From the i could Update logic to use system_state instead of multiple booleans:
-## Example
-#- lambda: |
-#    if (id(system_state) == 0) {  // Idle
-#      id(last_trigger_time) = millis();
-#      id(system_state) = 1;       // Up active
-#    }
 
+  # ---- Color Preset Globals ----
+  # All effects read from these; updated by select entity actions
+  - id: preset_h
+    type: uint8_t
+    restore_value: yes
+    initial_value: '30'    # Warm White hue
+  - id: preset_s
+    type: uint8_t
+    restore_value: yes
+    initial_value: '60'    # Warm White saturation
+  - id: preset_v
+    type: uint8_t
+    restore_value: yes
+    initial_value: '220'   # Warm White brightness
 
-# HA tracking
+  # Platform section (LEDs 16-51) gets its own independent color
+  - id: platform_h
+    type: uint8_t
+    restore_value: yes
+    initial_value: '160'   # Cool Blue hue
+  - id: platform_s
+    type: uint8_t
+    restore_value: yes
+    initial_value: '255'
+  - id: platform_v
+    type: uint8_t
+    restore_value: yes
+    initial_value: '170'
+
+  # Custom preset values (used when "Custom" selected in either select)
+  - id: custom_h
+    type: uint8_t
+    restore_value: yes
+    initial_value: '128'
+  - id: custom_s
+    type: uint8_t
+    restore_value: yes
+    initial_value: '255'
+  - id: custom_v
+    type: uint8_t
+    restore_value: yes
+    initial_value: '200'
+
+  # ---- Runtime Tunables ----
+  - id: effect_speed
+    type: int
+    restore_value: yes
+    initial_value: '1'     # 1 = full speed, 2-5 = progressively slower
+  - id: illuminance_threshold
+    type: float
+    restore_value: yes
+    initial_value: '75.0'  # Lux below which lights trigger (when gating enabled)
+  - id: illuminance_gating_enabled
+    type: bool
+    restore_value: yes
+    initial_value: 'false' # Disabled by default; enable via HA switch
+  - id: fade_off_delay_ms
+    type: uint32_t
+    restore_value: yes
+    initial_value: '500'   # ms to wait after PIR clears before fading off
+  - id: dwell_time_ms
+    type: uint32_t
+    restore_value: yes
+    initial_value: '6000'  # ms lights stay on after fade-off effect completes
+  - id: light_timeout_ms
+    type: uint32_t
+    restore_value: yes
+    initial_value: '60000' # Safety timeout (60 seconds)
+
+# ==============================================================
+# SENSORS
+# ==============================================================
 sensor:
   - platform: template
     name: "System State"
@@ -142,6 +235,7 @@ sensor:
     lambda: 'return id(system_state);'
     unit_of_measurement: ""
     icon: "mdi:state-machine"
+
   - platform: template
     name: "Last PIR Triggered"
     id: last_pir_sensor
@@ -149,20 +243,10 @@ sensor:
     lambda: 'return id(last_pir);'
     unit_of_measurement: ""
     icon: "mdi:motion-sensor"
-#  - platform: template
-#    name: "Effect Finished"
-#    id: effect_finished_sensor
-#    update_interval: 1s
-#    lambda: 'return id(effect_finished) ? 1 : 0;'
-#    unit_of_measurement: ""
-#    icon: "mdi:check-circle"
-#  - platform: template
-#    name: "Disco Mode Active"
-#    id: disco_mode_sensor
-#    update_interval: 1s
-#    lambda: 'return id(disco_mode_active) ? 1 : 0;'
-#    unit_of_measurement: ""
-#    icon: "mdi:disco"
+
+  # WARNING: GPIO0 is the ESP8266 boot pin. If DHT11 pulls it LOW
+  # at power-on, the device enters flash mode and won't boot.
+  # Hardware fix: move DHT11 to GPIO3 (RX) and adjust below.
   - platform: dht
     model: DHT11
     pin: GPIO0
@@ -170,56 +254,26 @@ sensor:
       name: "Stair Light Enclosure Temperature"
       filters:
         - lambda: return x * (9.0/5.0) + 32.0;
-        - offset: 8.0 # adds 8 degrees to the reading
+        - offset: 8.0
       unit_of_measurement: "°F"
     humidity:
       name: "Stair Light Enclosure Humidity"
     update_interval: 60s
 
   - platform: homeassistant
-  # pull the illuminance value from sensor.hue_motion_sensor_1_illuminance
     id: hue_illuminance
     entity_id: sensor.hue_motion_sensor_1_illuminance
-    internal: True # only exploses entity to esp
-#  - platform: homeassistant # tells ESPHome to use the homeassistant.
-#    device: bh-1750-light-sensor # The hostname of your ESP32 device
-#    id: remote_light_sensor
-#    entity_id: sensor.bh_1750_light_sensor_bh1750_illuminance
-#    name: "Remote Ambient Light Level"
-#    unit_of_measurement: "lx"
-#    force_update: True
-#    sensor: bh1750_illuminance # The ID of the light sensor on the ESP32
-## Ambient Light Sensor
-#sensor:
-#  - platform: bh1750
-#    name: "Ambient Light"
-#    id: ambient_light
-#    update_interval: 60s
-#light:
-#  - platform: neopixelbus
-#    ...
-#    on_state:
-#      then:
-#        - lambda: |
-#            if (id(ambient_light).state < 50) {  // Lux threshold
-#              id(stair_light).turn_on().set_brightness(0.8);
-#            } else {
-#              id(stair_light).turn_on().set_brightness(0.4);
-#            }
+    internal: true
 
 text_sensor:
-  # template sensor to evaluate the illuminance value and display the appropriate text. 
-  # This sensor will read the hue_illuminance sensor and output a string.
   - platform: template
     name: "Light Status"
     id: light_status_text
-    # reads the state of the hue_illuminance sensor and returns a string based on the conditional statements
-    # use the return {}; syntax with a value inside the curly braces. This converts the C-style string into the expected optional<string> type
     lambda: |-
       float illuminance = id(hue_illuminance).state;
       std::string status;
       if (illuminance > 90.0) {
-        status = "way to sunny";
+        status = "way too sunny";
       } else if (illuminance > 70.0) {
         status = "light is on";
       } else {
@@ -227,87 +281,282 @@ text_sensor:
       }
       return {to_string(illuminance) + " lux (" + status + ")"};
 
+# ==============================================================
+# COLOR PRESET SELECTS
+# Choose named color for stair sections. Updates preset globals
+# which all effects read dynamically on each frame.
+# ==============================================================
+select:
+  - platform: template
+    name: "Stair Color Preset"
+    id: color_preset_select
+    options:
+      - "Warm White"
+      - "Cool Blue"
+      - "Sunset Orange"
+      - "Forest Green"
+      - "Purple Haze"
+      - "Custom"
+    initial_option: "Warm White"
+    restore_value: true
+    optimistic: true
+    set_action:
+      - lambda: |-
+          if (x == "Warm White") {
+            id(preset_h) = 30;  id(preset_s) = 60;  id(preset_v) = 220;
+          } else if (x == "Cool Blue") {
+            id(preset_h) = 160; id(preset_s) = 200; id(preset_v) = 200;
+          } else if (x == "Sunset Orange") {
+            id(preset_h) = 15;  id(preset_s) = 240; id(preset_v) = 200;
+          } else if (x == "Forest Green") {
+            id(preset_h) = 95;  id(preset_s) = 200; id(preset_v) = 150;
+          } else if (x == "Purple Haze") {
+            id(preset_h) = 200; id(preset_s) = 220; id(preset_v) = 180;
+          } else {
+            // Custom: pull from the custom H/S/V number sliders
+            id(preset_h) = id(custom_h);
+            id(preset_s) = id(custom_s);
+            id(preset_v) = id(custom_v);
+          }
+
+  - platform: template
+    name: "Platform Color Preset"
+    id: platform_preset_select
+    options:
+      - "Warm White"
+      - "Cool Blue"
+      - "Sunset Orange"
+      - "Forest Green"
+      - "Purple Haze"
+      - "Match Primary"
+      - "Custom"
+    initial_option: "Cool Blue"
+    restore_value: true
+    optimistic: true
+    set_action:
+      - lambda: |-
+          if (x == "Warm White") {
+            id(platform_h) = 30;  id(platform_s) = 60;  id(platform_v) = 220;
+          } else if (x == "Cool Blue") {
+            id(platform_h) = 160; id(platform_s) = 255; id(platform_v) = 170;
+          } else if (x == "Sunset Orange") {
+            id(platform_h) = 15;  id(platform_s) = 240; id(platform_v) = 200;
+          } else if (x == "Forest Green") {
+            id(platform_h) = 95;  id(platform_s) = 200; id(platform_v) = 150;
+          } else if (x == "Purple Haze") {
+            id(platform_h) = 200; id(platform_s) = 220; id(platform_v) = 180;
+          } else if (x == "Match Primary") {
+            // Sync platform color to current stair preset
+            id(platform_h) = id(preset_h);
+            id(platform_s) = id(preset_s);
+            id(platform_v) = id(preset_v);
+          } else {
+            id(platform_h) = id(custom_h);
+            id(platform_s) = id(custom_s);
+            id(platform_v) = id(custom_v);
+          }
+
+# ==============================================================
+# NUMBER ENTITIES
+# All tunables exposed to HA and the built-in web UI
+# ==============================================================
 number:
   - platform: template
     name: "LED Group Size"
     id: led_group_size_number
     min_value: 1
-    max_value: 20  # Adjust as needed
+    max_value: 20
     step: 1
     restore_value: yes
     optimistic: true
     set_action:
-      - lambda: 'id(led_group_size) = x;'
+      - lambda: 'id(led_group_size) = (int)x;'
 
+  - platform: template
+    name: "LED Platform Group Size"
+    id: led_platform_group_size_number
+    min_value: 1
+    max_value: 36
+    step: 1
+    restore_value: yes
+    optimistic: true
+    set_action:
+      - lambda: 'id(led_platform_group_size) = (int)x;'
+
+  # --- Custom color sliders (active when "Custom" preset selected) ---
+  - platform: template
+    name: "Custom Color Hue"
+    id: custom_hue_number
+    min_value: 0
+    max_value: 255
+    step: 1
+    restore_value: yes
+    optimistic: true
+    set_action:
+      - lambda: 'id(custom_h) = (uint8_t)x;'
+
+  - platform: template
+    name: "Custom Color Saturation"
+    id: custom_sat_number
+    min_value: 0
+    max_value: 255
+    step: 1
+    restore_value: yes
+    optimistic: true
+    set_action:
+      - lambda: 'id(custom_s) = (uint8_t)x;'
+
+  - platform: template
+    name: "Custom Color Brightness"
+    id: custom_val_number
+    min_value: 0
+    max_value: 255
+    step: 1
+    restore_value: yes
+    optimistic: true
+    set_action:
+      - lambda: 'id(custom_v) = (uint8_t)x;'
+
+  # --- Effect speed: 1 = full speed, each step up skips one extra frame ---
+  - platform: template
+    name: "Effect Speed (1=fast 5=slow)"
+    id: effect_speed_number
+    min_value: 1
+    max_value: 5
+    step: 1
+    restore_value: yes
+    optimistic: true
+    set_action:
+      - lambda: 'id(effect_speed) = (int)x;'
+
+  # --- Illuminance threshold in lux ---
+  - platform: template
+    name: "Illuminance Threshold (lux)"
+    id: illuminance_threshold_number
+    min_value: 0
+    max_value: 500
+    step: 5
+    restore_value: yes
+    optimistic: true
+    set_action:
+      - lambda: 'id(illuminance_threshold) = x;'
+
+  # --- Safety timeout before auto-off ---
+  - platform: template
+    name: "Light Timeout (seconds)"
+    id: light_timeout_number
+    min_value: 30
+    max_value: 300
+    step: 10
+    restore_value: yes
+    optimistic: true
+    set_action:
+      - lambda: 'id(light_timeout_ms) = (uint32_t)(x * 1000);'
+
+  # --- Delay after PIR clears before fade-off starts ---
+  - platform: template
+    name: "Fade Off Delay (ms)"
+    id: fade_off_delay_number
+    min_value: 0
+    max_value: 5000
+    step: 100
+    restore_value: yes
+    optimistic: true
+    set_action:
+      - lambda: 'id(fade_off_delay_ms) = (uint32_t)x;'
+
+  # --- How long lights stay on after fade-off effect completes ---
+  - platform: template
+    name: "Dwell Time (seconds)"
+    id: dwell_time_number
+    min_value: 0
+    max_value: 30
+    step: 1
+    restore_value: yes
+    optimistic: true
+    set_action:
+      - lambda: 'id(dwell_time_ms) = (uint32_t)(x * 1000);'
+
+# ==============================================================
+# SWITCH: Illuminance Gating
+# When ON, PIR triggers only fire when lux < illuminance_threshold
+# Useful to prevent lights activating in daylight
+# ==============================================================
+switch:
+  - platform: template
+    name: "Illuminance Gating"
+    id: illuminance_gating_switch
+    restore_mode: RESTORE_DEFAULT_OFF
+    optimistic: true
+    turn_on_action:
+      - lambda: 'id(illuminance_gating_enabled) = true;'
+    turn_off_action:
+      - lambda: 'id(illuminance_gating_enabled) = false;'
 
 output:
   - platform: esp8266_pwm
     id: storage_output
-    pin: GPIO5
+    pin: GPIO2
 
-
+# ==============================================================
+# BINARY SENSORS
+# ==============================================================
 binary_sensor:
   - platform: gpio
     pin:
       number: 13
-      #mode: INPUT_PULLUP
-      #inverted: true 
     name: "PIR Sensor (Storage)"
     id: storage_pir_sensor
-    filters:
     device_class: motion
     on_press:
       - light.turn_on: Storage_light
-#      - if: 
-#          condition:
-#            or:
-#              - sun.is_below_horizon:
-#              - lambda: return id(remote_light_sensor).state < 11;
-#          then:
-#            - light.turn_on: Storage_light
     on_release:
       - light.turn_off: Storage_light
 
+  # ---- Upper PIR: Person walking DOWN the stairs ----
   - platform: gpio
     pin:
       number: 12
-      #mode: INPUT_PULLUP
-      #inverted: true 
     name: "PIR Sensor (Upper)"
     id: upper_pir_sensor
     filters:
-      - delayed_on: 80ms #100ms  # Debounce on
-      - delayed_off: 100ms # Debounce off    
+      - delayed_on: 80ms
+      - delayed_off: 100ms
     device_class: motion
     on_press:
       then:
-        # Easter egg trigger check for disco mode
-        # Trigger: Activate both PIR sensors (upper and lower) simultaneously three times within a 5-second window.
-        # Effect: "Disco Mode" activates, creating a colorful, rotating rainbow pattern across all LEDs.
-        # Duration: The effect runs for 10 seconds before automatically turning off and resetting the system.
-        # Visual: LEDs cycle through hues with a smooth rainbow effect, shifting colors every 200ms.
+        # Easter Egg: Disco Mode
+        # Trigger both PIRs simultaneously 3x within 5 seconds
+        # CHANGE: Added special_effect_active mutex check
         - lambda: |
-            if (id(lower_pir_sensor).state) {  // Both PIRs active
+            if (id(lower_pir_sensor).state && !id(special_effect_active)) {
               if (millis() - id(last_disco_trigger_time) < 5000) {
                 id(disco_trigger_count)++;
               } else {
-                id(disco_trigger_count) = 1;  // Reset count if too much time passed
+                id(disco_trigger_count) = 1;
               }
               id(last_disco_trigger_time) = millis();
               if (id(disco_trigger_count) >= 3 && !id(disco_mode_active)) {
                 id(disco_mode_active) = true;
+                id(special_effect_active) = true;
                 id(stair_light).turn_on().set_effect("Disco Mode");
               }
             }
 
-        ## Trigger to test unified fade 
+        # Trigger: Initial down-fade when system is idle
+        # CHANGE: system_state == 0 replaces the (!up && !down) || (!up && light==0) combo
+        # NEW: Illuminance gating check (bypassed if switch is off)
         - if:
             condition:
-              lambda: 'return ((!id(up_sequence_active) && !id(down_sequence_active)) || (!id(up_sequence_active) && id(light_state) == 0));'
+              lambda: |-
+                bool state_ok = (id(system_state) == 0);
+                bool light_ok = !id(illuminance_gating_enabled) ||
+                                (id(hue_illuminance).state < id(illuminance_threshold));
+                return state_ok && light_ok;
             then:
               - lambda: |
-                  id(fade_direction_up) = false;  // Down
-                  id(fade_on) = true;             // On (white)
+                  id(fade_direction_up) = false;
+                  id(fade_on) = true;
               - light.turn_on:
                   id: stair_light
                   effect: "Fade Control V2"
@@ -315,36 +564,16 @@ binary_sensor:
                   condition:
                     lambda: 'return id(effect_finished);'
               - lambda: |
-                  id(down_sequence_active) = true;
+                  id(system_state) = 2;   // down_active
                   id(effect_finished) = false;
                   id(last_trigger_time) = millis();
                   id(last_pir) = 2;
-                  id(light_state) = 1;
 
-        ## Default Action for Going Down
-        #- if:
-        #    condition:
-        #       lambda: 'return ((!id(up_sequence_active) && !id(down_sequence_active)) || (!id(up_sequence_active) && id(light_state) == 0));'  # Only trigger if no sequence is active
-        #    then:
-        #      - light.turn_on:
-        #          id: stair_light
-        #          effect: "Group Fade on DOWN"
-        #      - wait_until:
-        #          condition:
-        #            lambda: 'return id(effect_finished);'
-        #      - lambda: |
-        #          id(down_sequence_active) = true;
-        #          id(effect_finished) = false;
-        #          id(last_trigger_time) = millis();
-        #          id(last_pir) = 2;
-        #          id(light_state) = 1;
-          
-        ## Default Action for turning halfway and going back Up 
+        # Trigger: Person turned around halfway — fade off going back up
+        # CHANGE: system_state == 2 replaces down_sequence_active + light_state check
         - if:
             condition:
-              lambda: 'return (id(effect_finished) && id(last_pir) == 2 && id(down_sequence_active) && id(light_state) == 1 );'
-              #lambda: 'return (id(last_trigger_time) > 4000 && id(last_pir) == 1 && id(up_sequence_active) && !id(lower_pir_sensor).state);'
-              #lambda: 'return (id(last_pir) == 1 && id(up_sequence_active) && !id(lower_pir_sensor).state);'
+              lambda: 'return (id(effect_finished) && id(last_pir) == 2 && id(system_state) == 2);'
             then:
               - light.turn_on:
                   id: stair_light
@@ -353,25 +582,23 @@ binary_sensor:
                   condition:
                     lambda: 'return id(effect_finished);'
               - lambda: |
-                  id(down_sequence_active) = false;
+                  id(system_state) = 0;
                   id(effect_finished) = false;
                   id(last_trigger_time) = 0;
                   id(last_pir) = 0;
-                  id(light_state) = 0;
-
 
     on_release:
       then:
         - lambda: 'id(last_pir_cleared_time) = millis();'
-        ## Default Action for turning off the lights going up
+        # Turn off after person has gone all the way up
+        # CHANGE: system_state == 1 replaces (up_active && !down_active)
+        # FIX: Removed useless wait_until(is_off) — sensor is already off
+        #      in on_release. Replaced with configurable fade_off_delay_ms.
         - if:
             condition:
-              lambda: 'return (id(up_sequence_active) == true && id(down_sequence_active) == false);'
+              lambda: 'return id(system_state) == 1;'
             then:
-              - wait_until:
-                  condition:
-                    binary_sensor.is_off: upper_pir_sensor
-                  timeout: 30s
+              - delay: !lambda 'return id(fade_off_delay_ms);'
               - light.turn_on:
                   id: stair_light
                   effect: "Group Fade off UP"
@@ -379,146 +606,93 @@ binary_sensor:
                   condition:
                     lambda: 'return id(effect_finished);'
               - lambda: |
-                  id(up_sequence_active) = false;
+                  id(system_state) = 0;   // FIXED: was incorrectly set to 1 in v1
                   id(effect_finished) = false;
                   id(last_pir_cleared_time) = 0;
                   id(last_trigger_time) = 0;
-                  id(system_state) = 1;
-              - delay: 
-                  6s
+              - delay: !lambda 'return id(dwell_time_ms);'
               - light.turn_off:
-                  id: stair_light              
+                  id: stair_light
 
-
+  # ---- Lower PIR: Person walking UP the stairs ----
   - platform: gpio
     pin:
       number: 14
-      #mode: INPUT_PULLUP
-      #inverted: true 
     name: "PIR Sensor (Lower)"
     id: lower_pir_sensor
     device_class: motion
     filters:
-      - delayed_on: 80ms #100ms  # Debounce on
-      - delayed_off: 200ms # Debounce off    
+      - delayed_on: 80ms
+      - delayed_off: 200ms
     on_press:
-        then:
-          # Easter egg trigger check
-          - lambda: |
-              if (id(upper_pir_sensor).state) {  // Both PIRs active
-                if (millis() - id(last_disco_trigger_time) < 5000) {
-                  id(disco_trigger_count)++;
-                } else {
-                  id(disco_trigger_count) = 1;  // Reset count if too much time passed
-                }
-                id(last_disco_trigger_time) = millis();
-                if (id(disco_trigger_count) >= 3 && !id(disco_mode_active)) {
-                  id(disco_mode_active) = true;
-                  id(stair_light).turn_on().set_effect("Disco Mode");
-                }
+      then:
+        # Easter Egg: Disco Mode (same logic as upper PIR)
+        # CHANGE: Added special_effect_active mutex check
+        - lambda: |
+            if (id(upper_pir_sensor).state && !id(special_effect_active)) {
+              if (millis() - id(last_disco_trigger_time) < 5000) {
+                id(disco_trigger_count)++;
+              } else {
+                id(disco_trigger_count) = 1;
               }
-          # "Secret Knock" Easter Egg
-          # Trigger: Rapidly trigger the lower PIR sensor 5 times within 3 seconds (like a secret knock).
-          # Effect: Activates a "Fire Flicker" effect that mimics a warm, flickering candlelight glow for 15 seconds.
-          # Purpose: Adds a cozy, mysterious ambiance, perfect for a dramatic stairwell entrance.
-          - lambda: |
+              id(last_disco_trigger_time) = millis();
+              if (id(disco_trigger_count) >= 3 && !id(disco_mode_active)) {
+                id(disco_mode_active) = true;
+                id(special_effect_active) = true;
+                id(stair_light).turn_on().set_effect("Disco Mode");
+              }
+            }
+
+        # Easter Egg: Secret Knock (Fire Flicker)
+        # Trigger lower PIR 5 times within 3 seconds
+        # CHANGE: Added special_effect_active mutex check
+        - lambda: |
+            if (!id(special_effect_active)) {
               if (millis() - id(last_knock_time) < 3000) {
                 id(knock_count)++;
               } else {
-                id(knock_count) = 1;  // Reset if too much time passed
+                id(knock_count) = 1;
               }
               id(last_knock_time) = millis();
               if (id(knock_count) >= 5) {
+                id(special_effect_active) = true;
                 id(stair_light).turn_on().set_effect("Fire Flicker");
-                id(knock_count) = 0;  // Reset after triggering
+                id(knock_count) = 0;
               }
-          #- lambda: |-
-          #      ESP_LOGD("Global Variables", "PIR Sensor (Lower) before condition");
-          #      ESP_LOGD("Global Variables", "light_state: %i", id(light_state));
-          #      ESP_LOGD("Global Variables", "up_sequence_active: %s", id(up_sequence_active) ? "true" : "false");
-          #      ESP_LOGD("Global Variables", "down_sequence_active: %s", id(down_sequence_active) ? "true" : "false");
-          #      ESP_LOGD("Global Variables", "last_pir: %i", id(last_pir));
-          #      ESP_LOGD("Global Variables", "last_trigger_time: %li", id(last_trigger_time));
-          #      ESP_LOGD("Global Variables", "last_pir_cleared_time: %li", id(last_pir_cleared_time));
-          #      ESP_LOGD("Global Variables", "effect_finished: %s", id(effect_finished) ? "true" : "false");
-          
-          ## Trigger to test unified fade 
-          - if:
-              condition:
-                and:
-                  - lambda: 'return ((!id(up_sequence_active) && !id(down_sequence_active)) || (!id(down_sequence_active) && id(light_state) == 0));'
-              then:
-                - lambda: |
-                    id(fade_direction_up) = true;  // Up
-                    id(fade_on) = true;            // On (white)
-                - light.turn_on:
-                    id: stair_light
-                    effect: "Fade Control V2"
-                - wait_until:
-                    condition:
-                      lambda: 'return id(effect_finished);'
-                - lambda: |
-                    id(up_sequence_active) = true;
-                    id(effect_finished) = false;
-                    id(last_trigger_time) = millis();
-                    id(last_pir) = 1;
-                    id(light_state) = 1;
-          
-          ## Default Action for Going Up
-          #- if:
-          #    condition:
-          #      and:
-          #        - lambda: 'return ((!id(up_sequence_active) && !id(down_sequence_active)) || (!id(down_sequence_active) && id(light_state) == 0));'
-          #    then:
-          #      - light.turn_on:
-          #          id: stair_light
-          #          effect: "Group Fade on UP"
-          #      - wait_until:
-          #          condition:
-          #            lambda: 'return id(effect_finished);'
-          #      - lambda: |
-          #          id(up_sequence_active) = true;
-          #          id(effect_finished) = false;
-          #          id(last_trigger_time) = millis();
-          #          id(last_pir) = 1;
-          #          id(light_state) = 1;
+            }
 
-          ## Default Action for turning halfway and going back Down 
-          - if:
-              condition:
-                and:
-                  - lambda: 'return (id(effect_finished) && id(last_pir) == 1 && id(up_sequence_active) && id(light_state) == 1 );'
-                  #- lambda: 'return id(last_pir) == 1 && (millis() - id(last_trigger_time)) < 5000;'
-                  #- binary_sensor.is_on: lower_pir_sensor
-                  # - lambda: 'return (id(last_trigger_time) > 4000 && id(last_pir) == 1 && id(up_sequence_active) && !id(lower_pir_sensor).state);'
-                  # - lambda: 'return (id(last_pir) == 1 && id(up_sequence_active) && !id(lower_pir_sensor).state);'
-                  # - lambda: 'return (millis() - id(last_trigger_time)) > 500;'  # 500ms cooldown
-              then:
-                - light.turn_on:
-                    id: stair_light
-                    effect: "Group Fade off Down"
-                - wait_until:
-                    condition:
-                      lambda: 'return id(effect_finished);'
-                - lambda: |
-                    id(up_sequence_active) = false;
-                    id(effect_finished) = false;
-                    id(last_trigger_time) = 0;
-                    id(last_pir) = 0;
-                    id(light_state) = 0;
-
-    on_release:
-      then:
-        - lambda: 'id(last_pir_cleared_time) = millis();'
-        ## Default Action for turning off the lights going Down
+        # Trigger: Initial up-fade when system is idle
+        # CHANGE: system_state == 0 replaces the (!up && !down) || (!down && light==0) combo
+        # NEW: Illuminance gating check
         - if:
             condition:
-              lambda: 'return (id(down_sequence_active) == true && id(up_sequence_active) == false);'
+              lambda: |-
+                bool state_ok = (id(system_state) == 0);
+                bool light_ok = !id(illuminance_gating_enabled) ||
+                                (id(hue_illuminance).state < id(illuminance_threshold));
+                return state_ok && light_ok;
             then:
+              - lambda: |
+                  id(fade_direction_up) = true;
+                  id(fade_on) = true;
+              - light.turn_on:
+                  id: stair_light
+                  effect: "Fade Control V2"
               - wait_until:
                   condition:
-                    binary_sensor.is_off: lower_pir_sensor
-                  timeout: 30s
+                    lambda: 'return id(effect_finished);'
+              - lambda: |
+                  id(system_state) = 1;   // up_active
+                  id(effect_finished) = false;
+                  id(last_trigger_time) = millis();
+                  id(last_pir) = 1;
+
+        # Trigger: Person turned around halfway — fade off going back down
+        # CHANGE: system_state == 1 replaces up_sequence_active + light_state check
+        - if:
+            condition:
+              lambda: 'return (id(effect_finished) && id(last_pir) == 1 && id(system_state) == 1);'
+            then:
               - light.turn_on:
                   id: stair_light
                   effect: "Group Fade off Down"
@@ -526,26 +700,44 @@ binary_sensor:
                   condition:
                     lambda: 'return id(effect_finished);'
               - lambda: |
-                  id(down_sequence_active) = false;
+                  id(system_state) = 0;
+                  id(effect_finished) = false;
+                  id(last_trigger_time) = 0;
+                  id(last_pir) = 0;
+
+    on_release:
+      then:
+        - lambda: 'id(last_pir_cleared_time) = millis();'
+        # Turn off after person has gone all the way down
+        # CHANGE: system_state == 2 replaces (down_active && !up_active)
+        # FIX: Replaced useless wait_until(is_off) with configurable delay
+        - if:
+            condition:
+              lambda: 'return id(system_state) == 2;'
+            then:
+              - delay: !lambda 'return id(fade_off_delay_ms);'
+              - light.turn_on:
+                  id: stair_light
+                  effect: "Group Fade off Down"
+              - wait_until:
+                  condition:
+                    lambda: 'return id(effect_finished);'
+              - lambda: |
+                  id(system_state) = 0;
                   id(effect_finished) = false;
                   id(last_pir_cleared_time) = 0;
                   id(last_trigger_time) = 0;
-                  id(system_state) = 2;
-              - delay: 
-                  6s
+              - delay: !lambda 'return id(dwell_time_ms);'
               - light.turn_off:
                   id: stair_light
 
-# Automation for special scenarios
-#The interval component checks every second if:
-#    The LED is on
-#    60 seconds have passed since last trigger
-#    Both PIRs are off
+# ==============================================================
+# INTERVALS
+# ==============================================================
 interval:
-  # Moonlight Mode" Easter Egg
-  # Trigger: Hold both PIR sensors active for 10 seconds (e.g., by standing still in range of both).
-  # Effect: Activates a gentle, pulsing blue "Moonlight" effect for 30 seconds, simulating moonlight on the stairs.
-  # Purpose: Creates a calming, nighttime aesthetic.
+  # Easter Egg: Moonlight Mode
+  # Hold both PIRs for 10 seconds → soft blue pulse for 30s
+  # CHANGE: Added special_effect_active mutex check
   - interval: 1s
     then:
       - if:
@@ -558,126 +750,83 @@ interval:
                 if (id(both_pir_start_time) == 0) {
                   id(both_pir_start_time) = millis();
                 }
-                if (millis() - id(both_pir_start_time) > 10000) {
+                if (millis() - id(both_pir_start_time) > 10000 && !id(special_effect_active)) {
+                  id(special_effect_active) = true;
                   id(stair_light).turn_on().set_effect("Moonlight");
-                  id(both_pir_start_time) = 0;  // Reset after triggering
+                  id(both_pir_start_time) = 0;
                 }
           else:
             - lambda: 'id(both_pir_start_time) = 0;'
+
+  # State debug logging + timeout recovery
+  # CHANGE: light_timeout_ms replaces hardcoded 60000
   - interval: 10s
     then:
       - lambda: |-
-            ESP_LOGD("Global Variables", "PIR Sensor (Lower) before condition");
-            ESP_LOGD("Global Variables", "light_state: %i", id(light_state));
-            ESP_LOGD("Global Variables", "up_sequence_active: %s", id(up_sequence_active) ? "true" : "false");
-            ESP_LOGD("Global Variables", "down_sequence_active: %s", id(down_sequence_active) ? "true" : "false");
-            ESP_LOGD("Global Variables", "last_pir: %i", id(last_pir));
-            ESP_LOGD("Global Variables", "last_trigger_time: %li", id(last_trigger_time));
-            ESP_LOGD("Global Variables", "last_pir_cleared_time: %li", id(last_pir_cleared_time));
-            ESP_LOGD("Global Variables", "effect_finished: %s", id(effect_finished) ? "true" : "false");
-      # Conditional debug logging 
-      #### need to test
-      #- if:
-      #    condition:
-      #      lambda: 'return ESPHOME_LOG_LEVEL >= ESPHOME_LOG_LEVEL_DEBUG;'
-      #    then:
-      #      - lambda: |-
-      #            //ESP_LOGD("Global Variables", "PIR Sensor (Lower) before condition");
-      #            ESP_LOGD("Global Variables", "light_state: %i", id(light_state));
-      #            ESP_LOGD("Global Variables", "up_sequence_active: %s", id(up_sequence_active) ? "true" : "false");
-      #            ESP_LOGD("Global Variables", "down_sequence_active: %s", id(down_sequence_active) ? "true" : "false");
-      #            ESP_LOGD("Global Variables", "last_pir: %i", id(last_pir));
-      #            ESP_LOGD("Global Variables", "last_trigger_time: %li", id(last_trigger_time));
-      #            ESP_LOGD("Global Variables", "last_pir_cleared_time: %li", id(last_pir_cleared_time));
-      #            ESP_LOGD("Global Variables", "effect_finished: %s", id(effect_finished) ? "true" : "false");
-      # Scenario 1: 1-minute timeout
+          ESP_LOGD("State", "system_state=%i  last_pir=%i  effect_finished=%s  special=%s",
+            id(system_state), id(last_pir),
+            id(effect_finished) ? "true" : "false",
+            id(special_effect_active) ? "true" : "false");
+          ESP_LOGD("State", "last_trigger=%lu ms ago  pir_cleared=%lu ms ago",
+            millis() - id(last_trigger_time),
+            millis() - id(last_pir_cleared_time));
+
+      # Scenario 1: Normal timeout — lights on too long with no motion
       - if:
           condition:
             and:
               - light.is_on: stair_light
-              - lambda: 'return (millis() - id(last_trigger_time)) > 60000 && id(effect_finished);'
+              - lambda: 'return (millis() - id(last_trigger_time)) > id(light_timeout_ms) && id(effect_finished);'
               - binary_sensor.is_off: upper_pir_sensor
               - binary_sensor.is_off: lower_pir_sensor
-              #- lambda: 'return !id(up_sequence_active) && !id(down_sequence_active);'  # Only if no sequence is active
           then:
             - light.turn_off: stair_light
             - lambda: |
-                id(up_sequence_active) = false;
-                id(down_sequence_active) = false;
-                id(effect_finished) = false;
-                id(light_state) = 0;
-                id(last_trigger_time) = 0;
-                id(last_pir) = 0;
                 id(system_state) = 0;
-      # Recovery from stuck state
+                id(effect_finished) = false;
+                id(last_trigger_time) = 0;
+                id(last_pir) = 0;
+                id(special_effect_active) = false;
+                ESP_LOGD("interval", "Light turned off by timeout");
+
+      # Scenario 2: Stuck-state recovery — light on but state says idle
       - if:
           condition:
             and:
               - light.is_on: stair_light
-              - lambda: 'return !id(up_sequence_active) && !id(down_sequence_active) && id(effect_finished) && (millis() - id(last_trigger_time)) > 60000;'
+              - lambda: 'return id(system_state) == 0 && id(effect_finished) && (millis() - id(last_trigger_time)) > id(light_timeout_ms);'
               - binary_sensor.is_off: upper_pir_sensor
               - binary_sensor.is_off: lower_pir_sensor
           then:
             - light.turn_off: stair_light
             - lambda: |
-                id(light_state) = 0;
                 id(last_trigger_time) = 0;
                 id(last_pir) = 0;
+                id(special_effect_active) = false;
                 ESP_LOGD("interval", "Recovered from stuck state");
-#      # Scenario 2: Same PIR after 25s clear (Lower PIR)
-#      - if:
-#          condition:
-#            and:
-#              - lambda: 'return (millis() - id(last_pir_cleared_time)) > 10000;'
-#              - lambda: 'return id(last_pir) == 1 && id(lower_pir_sensor)->state;'
-#          then:
-#            - light.turn_on:
-#                id: stair_light
-#                effect: "Fade off DOWN"
-#                # changed to from true to false
-#            - lambda: 'id(up_sequence_active) = false;'
-      # Scenario 2: Same PIR after 25s clear (Upper PIR)
-#      - if:
-#          condition:
-#            and:
-#              - lambda: 'return (millis() - id(last_pir_cleared_time)) > 10000;'
-#              - lambda: 'return id(last_pir) == 2 && id(upper_pir_sensor)->state;'
-#          then:
-#            - light.turn_on:
-#                id: stair_light
-#                effect: "Fade off UP"
-                # changed to from true to false                
-#            - lambda: 'id(down_sequence_active) = false;'
 
 wled:
 
+# ==============================================================
+# LIGHTS
+# ==============================================================
 light:
   # Storage Lights
-  #  - platform: neopixelbus
-  #    type: GRB
-  #    variant: WS2811
-  #    pin: GPIO5
-  #    num_leds: 60
-  #    name: "Storage Light"
-  #    id: "Storage_light"
-  #    restore_mode: ALWAYS_OFF
+  - platform: neopixelbus
+    type: GRB
+    variant: WS2811
+    pin: GPIO5
+    num_leds: 60
+    name: "Addressable Light"
+    id: "Addessable_light"
+    restore_mode: ALWAYS_OFF
+
   - platform: monochromatic
-    #MOSFET: The MOSFET acts as the switch. (IRF520, IRLZ44N, IRF540, IRLB8721).
-    # GPIO5 to gate
-    #Connect the MOSFET's Source pin to the GND of both the ESP8266 and the 12V power supply. This creates a common ground.
-    # negative (-) wire of the LED strip to the Drain pin of the MOSFET.
-    #12V Power Supply:
-    #positive (+) terminal of the 12V power supply to the positive wire of the LED strip.
-    #negative (-) terminal of the 12V power supply to the Source of the MOSFET.
-    #When the ESP8266's GPIO5 goes high, it "opens" the MOSFET, allowing current to flow from the LED strip's negative wire through the MOSFET to the common ground, completing the circuit and turning the lights on.
-    # pin 1 - source, pin 2 - gate, pin 3 - drain
     id: "Storage_light"
     name: "Storage Light"
     output: storage_output
 
-
-
-# Stair lights
+  # ---- Stair Lights ----
   - platform: neopixelbus
     type: BRG
     variant: WS2811
@@ -687,272 +836,265 @@ light:
     id: "stair_light"
     restore_mode: ALWAYS_OFF
     effects:
+      # ==========================================================
+      # SINGLE-LED FADE EFFECTS
+      # These are kept for backward compatibility but are superseded
+      # by Fade Control V2. All now use preset color globals and
+      # support frame-skip speed control.
+      # ==========================================================
       - addressable_lambda:
           name: "Fade on DOWN"
-          #update_interval: 30ms #15ms is a nice number
           update_interval: 15ms
           lambda: |-
-            //initializes the progress variable to 0. This variable is intended to track which LED is being lit.
-            static auto TAG = "Fade on DOWN";
-            static ESPHSVColor mColor = ESPHSVColor(255, 0, 250);
-            // Static variables keep their value even when
-            // stopping and starting the effect again
             static uint16_t progress = 0;
-            static bool effect_complete = false;  // New flag to track completion
+            static bool effect_complete = false;
+            static uint8_t frame_skip = 0;
+            // Read color dynamically so preset changes take effect immediately
+            ESPHSVColor mColor = ESPHSVColor(id(preset_h), id(preset_s), id(preset_v));
 
-            // normal variables lose their value after each
-            // execution - basically after each update_interval
-            uint16_t changes = 0;
-
-            // To reset static when stopping and starting the effect
-            // again you can use the initial_run variables
-            // initial_run resets the progress to 0.
             if (initial_run) {
-              progress = 0;
-              effect_complete = false;  // Reset completion flag
+              progress = 0; effect_complete = false; frame_skip = 0;
               it.all() = Color::BLACK;
-              ESP_LOGD("effect", "Fade on DOWN started");
-              // optionally do a return so nothing happens until the next update_interval
               return;
             }
+            if (++frame_skip < id(effect_speed)) return;
+            frame_skip = 0;
 
             if (progress < it.size()) {
+              it[it.size() - progress - 1] = mColor;
               progress++;
-              it[it.size() - progress] = mColor;
               effect_complete = false;
-              //ESP_LOGD("effect", "Progress: %d", progress);
             } else {
               effect_complete = true;
             }
             id(effect_finished) = effect_complete;
+
       - addressable_lambda:
           name: "Fade off DOWN"
-          update_interval: 15ms #15ms is a nice number
+          update_interval: 15ms
           lambda: |-
-            static auto TAG = "Fade off DOWN";
-            static ESPHSVColor mBlack = ESPHSVColor(255, 255, 0);
-            // Static variables keep their value even when
-            // stopping and starting the effect again
             static uint16_t progress = 0;
-            static bool effect_complete = false;  // New flag to track completion
+            static bool effect_complete = false;
+            static uint8_t frame_skip = 0;
 
-            // normal variables lose their value after each
-            // execution - basically after each update_interval
-            uint16_t changes = 0;
-
-            // To reset static when stopping and starting the effect
-            // again you can use the initial_run variables
             if (initial_run) {
-              progress = 0;
-              effect_complete = false;  // Reset completion flag
-              //it.all() = Color::BLACK;
-              // optionally do a return so nothing happens until the next update_interval
+              progress = 0; effect_complete = false; frame_skip = 0;
               return;
             }
+            if (++frame_skip < id(effect_speed)) return;
+            frame_skip = 0;
 
             if (progress < it.size()) {
+              it[it.size() - progress - 1] = Color::BLACK;
               progress++;
-              it[it.size() - progress] = mBlack;
               effect_complete = false;
             } else {
               effect_complete = true;
             }
             id(effect_finished) = effect_complete;
+
       - addressable_lambda:
           name: "Fade on UP"
-          update_interval: 15ms #15ms is a nice number
+          update_interval: 15ms
           lambda: |-
-            static auto TAG = "Fade on UP";
-            static ESPHSVColor mColor = ESPHSVColor(255, 0, 250);
-            // Static variables keep their value even when
-            // stopping and starting the effect again
             static uint16_t progress = 0;
-            static bool effect_complete = false;  // New flag to track completion
+            static bool effect_complete = false;
+            static uint8_t frame_skip = 0;
+            ESPHSVColor mColor = ESPHSVColor(id(preset_h), id(preset_s), id(preset_v));
 
-            // normal variables lose their value after each
-            // execution - basically after each update_interval
-            uint16_t changes = 0;
-
-            // To reset static when stopping and starting the effect
-            // again you can use the initial_run variables
             if (initial_run) {
-              progress = 0;
-              effect_complete = false;  // Reset completion flag
+              progress = 0; effect_complete = false; frame_skip = 0;
               it.all() = Color::BLACK;
-              // optionally do a return so nothing happens until the next update_interval
               return;
             }
+            if (++frame_skip < id(effect_speed)) return;
+            frame_skip = 0;
 
             if (progress < it.size()) {
               it[progress] = mColor;
               progress++;
-              effect_complete = false;  // Effect still running
+              effect_complete = false;
             } else {
-              effect_complete = true;   // Effect has finished
-            };
-            // Expose the completion status to global
+              effect_complete = true;
+            }
             id(effect_finished) = effect_complete;
+
       - addressable_lambda:
           name: "Fade off UP"
-          update_interval: 15ms #15ms is a nice number
+          update_interval: 15ms
           lambda: |-
-            static auto TAG = "Fade off UP";
-            static ESPHSVColor mBlack = ESPHSVColor(255, 255, 0);
-            // Static variables keep their value even when
-            // stopping and starting the effect again
             static uint16_t progress = 0;
-            static bool effect_complete = false;  // New flag to track completion
+            static bool effect_complete = false;
+            static uint8_t frame_skip = 0;
 
-            // normal variables lose their value after each
-            // execution - basically after each update_interval
-            uint16_t changes = 0;
-
-            // To reset static when stopping and starting the effect
-            // again you can use the initial_run variables
             if (initial_run) {
-              progress = 0;
-              effect_complete = false;  // Reset completion flag
-              // it.all() = Color::BLACK;
-              // optionally do a return so nothing happens until the next update_interval
+              progress = 0; effect_complete = false; frame_skip = 0;
               return;
             }
+            if (++frame_skip < id(effect_speed)) return;
+            frame_skip = 0;
 
             if (progress < it.size()) {
-              it[progress] = mBlack;
+              it[progress] = Color::BLACK;
               progress++;
-              effect_complete = false;  // Effect still running
+              effect_complete = false;
             } else {
-              effect_complete = true;   // Effect has finished
+              effect_complete = true;
             }
-            // Expose the completion status to global
             id(effect_finished) = effect_complete;
+
+      # ==========================================================
+      # GROUP FADE EFFECTS
+      # Updated to use preset color globals + frame-skip speed.
+      # ==========================================================
       - addressable_lambda:
           name: "Group Fade on DOWN"
           update_interval: 50ms
           lambda: |-
             uint16_t GROUP_SIZE = id(led_group_size);
-            //static const uint16_t GROUP_SIZE = 2;
-            static ESPHSVColor mColor = ESPHSVColor(255, 0, 250);
             static uint16_t progress = 0;
-            static bool effect_complete = false;  // New flag to track completion
+            static bool effect_complete = false;
+            static uint8_t frame_skip = 0;
+            ESPHSVColor mColor = ESPHSVColor(id(preset_h), id(preset_s), id(preset_v));
 
             if (initial_run) {
-              progress = 0;
-              effect_complete = false;
+              progress = 0; effect_complete = false; frame_skip = 0;
               it.all() = Color::BLACK;
               return;
             }
+            if (++frame_skip < id(effect_speed)) return;
+            frame_skip = 0;
 
             if (progress < it.size()) {
               for (uint16_t i = 0; i < GROUP_SIZE; i++) {
-                uint16_t led_index = it.size() - progress - i - 1;
-                if (led_index < it.size()) { // Ensure index is within bounds
-                  it[led_index] = mColor;
-                }
+                uint16_t idx = it.size() - progress - i - 1;
+                if (idx < it.size()) it[idx] = mColor;
               }
               progress += GROUP_SIZE;
-              effect_complete = false;  // Effect still running
+              effect_complete = false;
             } else {
-              effect_complete = true;   // Effect has finished
+              effect_complete = true;
             }
-            // Expose the completion status to global
             id(effect_finished) = effect_complete;
+
       - addressable_lambda:
           name: "Group Fade off DOWN"
           update_interval: 50ms
           lambda: |-
             uint16_t GROUP_SIZE = id(led_group_size);
-            //static const uint16_t GROUP_SIZE = 2;
-            static ESPHSVColor mColor = ESPHSVColor(255, 255, 0);
             static uint16_t progress = 0;
-            static bool effect_complete = false;  // New flag to track completion
+            static bool effect_complete = false;
+            static uint8_t frame_skip = 0;
 
             if (initial_run) {
-              progress = 0;
-              effect_complete = false;
+              progress = 0; effect_complete = false; frame_skip = 0;
               return;
             }
+            if (++frame_skip < id(effect_speed)) return;
+            frame_skip = 0;
 
             if (progress < it.size()) {
               for (uint16_t i = 0; i < GROUP_SIZE; i++) {
-                uint16_t led_index = it.size() - progress - i - 1;
-                if (led_index < it.size()) { // Ensure index is within bounds
-                  it[led_index] = mColor;
-                }
+                uint16_t idx = it.size() - progress - i - 1;
+                if (idx < it.size()) it[idx] = Color::BLACK;
               }
               progress += GROUP_SIZE;
-              effect_complete = false;  // Effect still running
+              effect_complete = false;
             } else {
-              effect_complete = true;   // Effect has finished
+              effect_complete = true;
             }
-            // Expose the completion status to global
             id(effect_finished) = effect_complete;
+
       - addressable_lambda:
           name: "Group Fade on UP"
           update_interval: 50ms
           lambda: |-
             uint16_t GROUP_SIZE = id(led_group_size);
-            //static const uint16_t GROUP_SIZE = 2;
-            static const uint16_t GAP_SIZE = 5;
-            static ESPHSVColor mColor = ESPHSVColor(255, 0, 250);
             static uint16_t progress = 0;
-            static bool effect_complete = false;  // New flag to track completion
+            static bool effect_complete = false;
+            static uint8_t frame_skip = 0;
+            ESPHSVColor mColor = ESPHSVColor(id(preset_h), id(preset_s), id(preset_v));
 
             if (initial_run) {
-              progress = 0;
-              effect_complete = false;
+              progress = 0; effect_complete = false; frame_skip = 0;
               it.all() = Color::BLACK;
               return;
             }
+            if (++frame_skip < id(effect_speed)) return;
+            frame_skip = 0;
 
             if (progress < it.size()) {
               for (uint16_t i = 0; i < GROUP_SIZE; i++) {
-                uint16_t led_index = progress + i;
-                if (led_index < it.size()) { // Ensure index is within bounds
-                  it[led_index] = mColor;
-                }
+                uint16_t idx = progress + i;
+                if (idx < it.size()) it[idx] = mColor;
               }
-              //progress += GROUP_SIZE + GAP_SIZE;
               progress += GROUP_SIZE;
-              effect_complete = false;  // Effect still running
+              effect_complete = false;
             } else {
-              effect_complete = true;   // Effect has finished
+              effect_complete = true;
             }
-            // Expose the completion status to global
             id(effect_finished) = effect_complete;
+
       - addressable_lambda:
           name: "Group Fade off UP"
           update_interval: 50ms
           lambda: |-
             uint16_t GROUP_SIZE = id(led_group_size);
-            //static const uint16_t GROUP_SIZE = 2;
-            static const uint16_t GAP_SIZE = 5;
-            static ESPHSVColor mColor = ESPHSVColor(255, 255, 0);
             static uint16_t progress = 0;
-            static bool effect_complete = false;  // New flag to track completion
+            static bool effect_complete = false;
+            static uint8_t frame_skip = 0;
 
             if (initial_run) {
-              progress = 0;
-              effect_complete = false;
+              progress = 0; effect_complete = false; frame_skip = 0;
               return;
             }
+            if (++frame_skip < id(effect_speed)) return;
+            frame_skip = 0;
 
             if (progress < it.size()) {
               for (uint16_t i = 0; i < GROUP_SIZE; i++) {
-                uint16_t led_index = progress + i;
-                if (led_index < it.size()) { // Ensure index is within bounds
-                  it[led_index] = mColor;
-                }
+                uint16_t idx = progress + i;
+                if (idx < it.size()) it[idx] = Color::BLACK;
               }
-              //progress += GROUP_SIZE + GAP_SIZE;
               progress += GROUP_SIZE;
-              //progress -= GROUP_SIZE; // Decrement progress
-              effect_complete = false;  // Effect still running
+              effect_complete = false;
             } else {
-              effect_complete = true;   // Effect has finished
+              effect_complete = true;
             }
-            // Expose the completion status to global
             id(effect_finished) = effect_complete;
+
+      # Note: Mixed casing preserved to avoid breaking automations
+      - addressable_lambda:
+          name: "Group Fade off Down"
+          update_interval: 50ms
+          lambda: |-
+            uint16_t GROUP_SIZE = id(led_group_size);
+            static uint16_t progress = 0;
+            static bool effect_complete = false;
+            static uint8_t frame_skip = 0;
+
+            if (initial_run) {
+              progress = 0; effect_complete = false; frame_skip = 0;
+              return;
+            }
+            if (++frame_skip < id(effect_speed)) return;
+            frame_skip = 0;
+
+            if (progress < it.size()) {
+              for (uint16_t i = 0; i < GROUP_SIZE; i++) {
+                uint16_t idx = it.size() - progress - i - 1;
+                if (idx < it.size()) it[idx] = Color::BLACK;
+              }
+              progress += GROUP_SIZE;
+              effect_complete = false;
+            } else {
+              effect_complete = true;
+            }
+            id(effect_finished) = effect_complete;
+
+      # ==========================================================
+      # BUILT-IN EFFECTS
+      # ==========================================================
       - addressable_color_wipe:
           name: forward wipe
           colors:
@@ -967,6 +1109,7 @@ light:
               num_leds: 1
           add_led_interval: 100ms
           reverse: false
+
       - addressable_color_wipe:
           name: rev wipe
           colors:
@@ -981,40 +1124,42 @@ light:
               num_leds: 1
           add_led_interval: 100ms
           reverse: true
+
       - addressable_rainbow:
           name: Rainbow Effect With Custom Values
           speed: 10
           width: 50
+
       - pulse:
           name: "Pulse"
           transition_length: 0.5s
           update_interval: 0.5s
-      # New Easter egg effect 1
+
+      # ==========================================================
+      # EASTER EGG EFFECTS
+      # CHANGE: All now clear special_effect_active on completion
+      # ==========================================================
       - addressable_lambda:
           name: "Disco Mode"
           update_interval: 200ms
           lambda: |-
             static uint8_t hue = 0;
-            static bool initial_run_complete = false;
             static uint32_t disco_start_time = 0;
 
             if (initial_run) {
               hue = 0;
-              initial_run_complete = false;
               disco_start_time = millis();
               it.all() = ESPHSVColor(0, 255, 150);
               return;
             }
 
-            // Run for 10 seconds then turn off
             if (millis() - disco_start_time > 10000) {
               it.all() = Color::BLACK;
               id(disco_mode_active) = false;
               id(disco_trigger_count) = 0;
               id(last_disco_trigger_time) = 0;
-              id(up_sequence_active) = false;
-              id(down_sequence_active) = false;
-              id(light_state) = 0;
+              id(system_state) = 0;
+              id(special_effect_active) = false;  // Release mutex
               id(stair_light).turn_off();
               return;
             }
@@ -1024,7 +1169,7 @@ light:
               uint8_t local_hue = (hue + (i * 10)) % 255;
               it[i] = ESPHSVColor(local_hue, 255, 150);
             }
-      # New Easter egg effect 2
+
       - addressable_lambda:
           name: "Fire Flicker"
           update_interval: 100ms
@@ -1032,19 +1177,20 @@ light:
             static uint32_t start_time = 0;
             if (initial_run) {
               start_time = millis();
-              it.all() = ESPHSVColor(20, 255, 100);  // Warm orange base
+              it.all() = ESPHSVColor(20, 255, 100);
               return;
             }
-            if (millis() - start_time > 15000) {  // Run for 15 seconds
+            if (millis() - start_time > 15000) {
               it.all() = Color::BLACK;
+              id(special_effect_active) = false;  // Release mutex
               id(stair_light).turn_off();
               return;
             }
             for (int i = 0; i < it.size(); i++) {
-              int flicker = random(0, 100);  // Random brightness variation
-              it[i] = ESPHSVColor(20, 255, 100 + flicker);  // Warm flickering glow
+              int flicker = random(0, 100);
+              it[i] = ESPHSVColor(20, 255, 100 + flicker);
             }
-      # New Easter egg effect 3
+
       - addressable_lambda:
           name: "Moonlight"
           update_interval: 500ms
@@ -1058,8 +1204,9 @@ light:
               increasing = true;
               return;
             }
-            if (millis() - start_time > 30000) {  // Run for 30 seconds
+            if (millis() - start_time > 30000) {
               it.all() = Color::BLACK;
+              id(special_effect_active) = false;  // Release mutex
               id(stair_light).turn_off();
               return;
             }
@@ -1070,9 +1217,11 @@ light:
               brightness -= 10;
               if (brightness <= 50) increasing = true;
             }
-            it.all() = ESPHSVColor(220, 255, brightness);  // Soft blue pulsing
-      # Description: A trail of light follows the direction of movement (up or down), with a gentle "breathing" pulse effect at the leading edge.
-      # Use Case: Combines motion tracking with a soothing visual cue.
+            it.all() = ESPHSVColor(220, 255, brightness);
+
+      # ==========================================================
+      # DECORATIVE / DEMO EFFECTS
+      # ==========================================================
       - addressable_lambda:
           name: "Breathing Trail"
           update_interval: 100ms
@@ -1082,15 +1231,15 @@ light:
             static bool increasing = true;
             static bool going_up = true;
             if (initial_run) {
-              lead_pos = id(up_sequence_active) ? 0 : it.size() - 1;
-              going_up = id(up_sequence_active);
+              // CHANGE: uses system_state instead of up_sequence_active
+              going_up = (id(system_state) == 1);
+              lead_pos = going_up ? 0 : it.size() - 1;
               breathe = 100;
               increasing = true;
               it.all() = Color::BLACK;
               return;
             }
             it.all() = Color::BLACK;
-            // Breathing effect at lead position
             if (increasing) {
               breathe += 20;
               if (breathe >= 200) increasing = false;
@@ -1098,13 +1247,12 @@ light:
               breathe -= 20;
               if (breathe <= 100) increasing = true;
             }
-            it[lead_pos] = ESPHSVColor(120, 255, breathe);  // Greenish pulse
-            // Trail behind
+            if (lead_pos >= 0 && lead_pos < it.size())
+              it[lead_pos] = ESPHSVColor(120, 255, breathe);
             for (int i = 1; i < 5; i++) {
               int trail_pos = going_up ? lead_pos - i : lead_pos + i;
-              if (trail_pos >= 0 && trail_pos < it.size()) {
-                it[trail_pos] = ESPHSVColor(120, 255, 50);  // Dimmer trail
-              }
+              if (trail_pos >= 0 && trail_pos < it.size())
+                it[trail_pos] = ESPHSVColor(120, 255, 50);
             }
             if (going_up) {
               lead_pos++;
@@ -1113,18 +1261,16 @@ light:
               lead_pos--;
               if (lead_pos < 0) id(effect_finished) = true;
             }
-      # Sescription: Lights up groups of LEDs (e.g., one group per stair) with a soft fade-in/fade-out, creating a clear path visualization.
-      # Use Case: Improves safety by clearly marking each step.
+
       - addressable_lambda:
           name: "Step Highlight"
           update_interval: 200ms
           lambda: |-
             static uint8_t brightness = 0;
             static bool fading_in = true;
-            const uint16_t leds_per_step = 10;  // Adjust based on your stairs
+            const uint16_t leds_per_step = 10;
             if (initial_run) {
-              brightness = 0;
-              fading_in = true;
+              brightness = 0; fading_in = true;
               it.all() = Color::BLACK;
               return;
             }
@@ -1132,32 +1278,29 @@ light:
               brightness += 20;
               if (brightness >= 200) fading_in = false;
             } else {
-              brightness -= 20;
-              if (brightness <= 0) fading_in = true;
+              if (brightness >= 20) brightness -= 20; else { brightness = 0; fading_in = true; }
             }
-            for (int i = 0; i < it.size(); i += leds_per_step) {
-              for (int j = 0; j < leds_per_step && (i + j) < it.size(); j++) {
-                it[i + j] = ESPHSVColor(40, 100, brightness);  // Warm yellow
-              }
-            }
-            id(effect_finished) = false;  // Runs until stopped
-      # Description: A single "wave" of light travels up or down the stairs, bouncing back and forth like a runner, with adjustable speed and color.
-      # Use Case: Highlights motion direction and adds a dynamic, playful touch.
+            for (int i = 0; i < it.size(); i += leds_per_step)
+              for (int j = 0; j < leds_per_step && (i + j) < it.size(); j++)
+                it[i + j] = ESPHSVColor(40, 100, brightness);
+            id(effect_finished) = false;
+
       - addressable_lambda:
           name: "Wave Runner"
           update_interval: 50ms
           lambda: |-
             static int position = 0;
             static bool going_up = true;
-            static ESPHSVColor wave_color = ESPHSVColor(160, 255, 200);  // Cyan
             if (initial_run) {
               position = 0;
-              going_up = id(up_sequence_active);  // Direction based on trigger
+              // CHANGE: uses system_state instead of up_sequence_active
+              going_up = (id(system_state) == 1);
               it.all() = Color::BLACK;
               return;
             }
-            it.all() = Color::BLACK;  // Clear previous frame
-            it[position] = wave_color;
+            it.all() = Color::BLACK;
+            // CHANGE: uses preset color instead of hardcoded cyan
+            it[position] = ESPHSVColor(id(preset_h), id(preset_s), id(preset_v));
             if (going_up) {
               position++;
               if (position >= it.size() - 1) going_up = false;
@@ -1165,37 +1308,76 @@ light:
               position--;
               if (position <= 0) going_up = true;
             }
-            id(effect_finished) = false;  // Keep running indefinitely until stopped
-      ## need to find a way to address the update interval better 
+            id(effect_finished) = false;
+
+      - addressable_lambda:
+          name: "Step Forward-Back Pattern"
+          update_interval: 100ms
+          lambda: |-
+            static int step = 0;
+            static int cycle = 0;
+            static int start_pos = 0;
+            static int leds_to_light = 1;
+            static bool turning_off = false;
+
+            for (int i = 0; i < it.size(); i++) it[i] = Color(0, 0, 0);
+
+            int end_pos = start_pos + leds_to_light;
+            if (end_pos > it.size()) end_pos = it.size();
+
+            if (!turning_off) {
+              for (int i = start_pos; i < end_pos && i < it.size(); i++)
+                it[i] = Color(255, 255, 255);
+              cycle++;
+              if (cycle >= leds_to_light) { turning_off = true; cycle = 0; }
+            } else {
+              int off_count = leds_to_light - cycle - 1;
+              for (int i = start_pos; i < end_pos - off_count && i < it.size(); i++)
+                it[i] = Color(255, 255, 255);
+              cycle++;
+              if (cycle >= leds_to_light - 1) {
+                turning_off = false; cycle = 0;
+                start_pos++; leds_to_light++;
+                if (start_pos >= it.size() || leds_to_light > it.size()) {
+                  start_pos = 0; leds_to_light = 1;
+                }
+              }
+            }
+            step++;
+
+      # ==========================================================
+      # FADE CONTROL (legacy single-LED unified version)
+      # ==========================================================
       - addressable_lambda:
           name: "Fade Control"
-          update_interval: 100ms #200ms
+          update_interval: 100ms
           lambda: |-
             static uint16_t progress = 0;
             static bool effect_complete = false;
-            static ESPHSVColor on_color = ESPHSVColor(255, 0, 170);   // White-ish (adjustable)
-            static ESPHSVColor off_color = ESPHSVColor(255, 255, 0);  // Black
+            static uint8_t frame_skip = 0;
 
             if (initial_run) {
-              progress = 0;
-              effect_complete = false;
-              it.all() = Color::BLACK;  // Clear LEDs on start
+              progress = 0; effect_complete = false; frame_skip = 0;
+              it.all() = Color::BLACK;
               return;
             }
+            if (++frame_skip < id(effect_speed)) return;
+            frame_skip = 0;
 
-            ESPHSVColor target_color = id(fade_on) ? on_color : off_color;
+            // CHANGE: reads from preset globals instead of static colors
+            ESPHSVColor target = id(fade_on)
+              ? ESPHSVColor(id(preset_h), id(preset_s), id(preset_v))
+              : ESPHSVColor(0, 0, 0);
             uint16_t group_size = id(led_group_size);
 
             if (progress < it.size()) {
               if (id(fade_direction_up)) {
-                // Fade UP
-                for (uint16_t i = 0; i < group_size && (progress + i) < it.size(); i++) {
-                  it[progress + i] = target_color;
-                }
+                for (uint16_t i = 0; i < group_size && (progress + i) < it.size(); i++)
+                  it[progress + i] = target;
               } else {
-                // Fade DOWN
-                for (uint16_t i = 0; i < group_size && (it.size() - progress - i - 1) < it.size(); i++) {
-                  it[it.size() - progress - i - 1] = target_color;
+                for (uint16_t i = 0; i < group_size; i++) {
+                  int idx = it.size() - progress - i - 1;
+                  if (idx >= 0 && idx < it.size()) it[idx] = target;
                 }
               }
               progress += group_size;
@@ -1203,151 +1385,101 @@ light:
             } else {
               effect_complete = true;
             }
-
             id(effect_finished) = effect_complete;
-      - addressable_lambda:
-          name: "Step Forward-Back Pattern"
-          update_interval: 100ms  # Adjust speed here (500ms = 0.5 seconds per step)
-          lambda: |-
-            static int step = 0;           // Overall step counter
-            static int cycle = 0;          // Tracks the cycle within each pattern
-            static int start_pos = 0;      // Starting LED position
-            static int leds_to_light = 1;  // Number of LEDs to light up
-            static bool turning_off = false;  // Flag for turning off phase
 
-            // Clear all LEDs first
-            for (int i = 0; i < it.size(); i++) {
-              it[i] = ESPColor(0, 0, 0);  // Turn off all LEDs
-            }
-
-            // Calculate current position and LEDs to affect
-            int current_pos = start_pos;
-            int end_pos = current_pos + leds_to_light;
-
-            if (end_pos > it.size()) end_pos = it.size();  // Cap at 58 LEDs
-
-            if (!turning_off) {
-              // Turning on phase
-              for (int i = current_pos; i < end_pos && i < it.size(); i++) {
-                it[i] = ESPColor(255, 255, 255);  // White light
-              }
-              cycle++;
-              if (cycle >= leds_to_light) {
-                turning_off = true;  // Switch to turning off phase
-                cycle = 0;
-              }
-            } else {
-              // Turning off phase (reverse order)
-              int off_count = leds_to_light - cycle - 1;
-              for (int i = current_pos; i < end_pos - off_count && i < it.size(); i++) {
-                it[i] = ESPColor(255, 255, 255);  // Keep earlier LEDs on
-              }
-              cycle++;
-              if (cycle >= leds_to_light - 1) {
-                // Finished turning off, move to next pattern
-                turning_off = false;
-                cycle = 0;
-                start_pos++;
-                leds_to_light++;
-                if (start_pos >= it.size() || leds_to_light > it.size()) {
-                  // Reset to start when reaching the end
-                  start_pos = 0;
-                  leds_to_light = 1;
-                }
-              }
-            }
-
-            step++;  // Increment overall step for timing
+      # ==========================================================
+      # FADE CONTROL V2 (PRIMARY EFFECT — section-aware)
+      #
+      # Sections:
+      #   sec1 (LEDs  0-15):  16 LEDs  — stair color preset
+      #   sec2+3 (LEDs 16-51): 36 LEDs — platform color preset
+      #   sec4 (LEDs 52-57):   6 LEDs  — stair color preset
+      #
+      # CHANGES:
+      #   - Colors read dynamically from preset_h/s/v and
+      #     platform_h/s/v globals (not static — changes live)
+      #   - Frame-skip speed control via effect_speed global
+      # ==========================================================
       - addressable_lambda:
           name: "Fade Control V2"
           update_interval: 140ms
           lambda: |-
             static uint16_t progress = 0;
             static bool effect_complete = false;
-            //static ESPHSVColor on_color = ESPHSVColor(255, 0, 170);    // White-ish (adjustable)
-            static ESPHSVColor blue_color = ESPHSVColor(255, 0, 170);    // White-ish (adjustable)
-            static ESPHSVColor off_color = ESPHSVColor(255, 255, 0);   // Black
-            //static ESPHSVColor blue_color = ESPHSVColor(160, 255, 170); // Blue (H:160°, S:100%, V:67%)
-            static ESPHSVColor on_color = ESPHSVColor(160, 255, 255); // Blue (H:160°, S:100%, V:67%)
-            static ESPHSVColor red_color = ESPHSVColor(240, 255, 170); // Blue (H:240°, S:100%, V:67%)
+            static uint8_t frame_skip = 0;
 
             if (initial_run) {
-              progress = 0;
-              effect_complete = false;
-              it.all() = Color::BLACK;  // Clear LEDs on start
+              progress = 0; effect_complete = false; frame_skip = 0;
+              it.all() = Color::BLACK;
               return;
             }
 
-            ESPHSVColor target_color = id(fade_on) ? on_color : off_color;
-            uint16_t group_size = id(led_group_size);
+            // Speed control: skip frames to slow down the effect
+            if (++frame_skip < id(effect_speed)) return;
+            frame_skip = 0;
+
+            // Read colors dynamically — not static, so preset changes apply immediately
+            ESPHSVColor on_color      = ESPHSVColor(id(preset_h),    id(preset_s),    id(preset_v));
+            ESPHSVColor platform_color = ESPHSVColor(id(platform_h), id(platform_s), id(platform_v));
+            ESPHSVColor off_color      = ESPHSVColor(0, 0, 0);
+            ESPHSVColor target         = id(fade_on) ? on_color      : off_color;
+            ESPHSVColor plat_target    = id(fade_on) ? platform_color : off_color;
+
+            uint16_t group_size      = id(led_group_size);
             uint16_t sec23_group_size = id(led_platform_group_size);
-            
-            // Define section boundaries (0-based indexing)
-            const uint16_t sec1_start = 0;    // 16 LEDs (0-15)
-            const uint16_t sec2_start = 16;   // Combined 36 LEDs (16-51) for sections 2+3
-            const uint16_t sec4_start = 52;   // 6 LEDs (52-57)
-            
-            // Section sizes
-            const uint16_t sizes[3] = {16, 36, 6};  // Sec 1, Sec 2+3, Sec 4
-            
+
+            // Section boundaries (0-based)
+            const uint16_t sec1_start = 0;
+            const uint16_t sec2_start = 16;
+            const uint16_t sec4_start = 52;
+            const uint16_t sec1_size  = 16;
+            const uint16_t sec23_size = 36;
+            const uint16_t sec4_size  = 6;
+
             if (progress < it.size()) {
               if (id(fade_direction_up)) {
-                // Fade UP
+                // UP: sec1 (bottom stairs) → sec2+3 (platform) → sec4 (top)
                 if (progress < sec2_start) {
-                  // Section 1 (16 LEDs)
-                  for (uint16_t i = 0; i < group_size && (progress + i) < sec2_start && (progress + i) < it.size(); i++) {
-                    it[progress + i] = target_color;
-                  }
+                  for (uint16_t i = 0; i < group_size && (progress + i) < sec2_start; i++)
+                    it[progress + i] = target;
                   progress += group_size;
-                  if (progress >= sizes[0]) progress = sec2_start;
+                  if (progress >= sec1_size) progress = sec2_start;
                 }
                 else if (progress < sec4_start) {
-                  // Combined Sections 2+3 (36 LEDs) - using blue
-                  for (uint16_t i = 0; i < sec23_group_size && (progress + i) < sec4_start && (progress + i) < it.size(); i++) {
-                    it[progress + i] = blue_color;
-                  }
+                  for (uint16_t i = 0; i < sec23_group_size && (progress + i) < sec4_start; i++)
+                    it[progress + i] = plat_target;
                   progress += sec23_group_size;
                   if (progress >= sec4_start) progress = sec4_start;
                 }
                 else {
-                  // Section 4 (6 LEDs)
-                  for (uint16_t i = 0; i < group_size && (progress + i) < it.size(); i++) {
-                    it[progress + i] = target_color;
-                  }
+                  for (uint16_t i = 0; i < group_size && (progress + i) < it.size(); i++)
+                    it[progress + i] = target;
                   progress += group_size;
                 }
               } else {
-                // Fade DOWN
-                uint16_t step = progress / group_size;  // For sec 1 and 4
-                uint16_t sec23_step = progress / sec23_group_size;
-
-                if (progress < sizes[2]) {
-                  // Section 4 (6 LEDs)
-                  uint16_t start = sec4_start + sizes[2] - ((step + 1) * group_size);
+                // DOWN: sec4 (top) → sec2+3 (platform) → sec1 (bottom stairs)
+                if (progress < sec4_size) {
+                  uint16_t step = progress / group_size;
+                  uint16_t start = sec4_start + sec4_size - ((step + 1) * group_size);
                   if (start < sec4_start) start = sec4_start;
-                  for (uint16_t i = 0; i < group_size && (start + i) < it.size(); i++) {
-                    it[start + i] = target_color;
-                  }
+                  for (uint16_t i = 0; i < group_size && (start + i) < it.size(); i++)
+                    it[start + i] = target;
                   progress += group_size;
                 }
-                else if (progress < sizes[2] + sizes[1]) {
-                  // Combined Sections 2+3 (36 LEDs) - using blue
-                  uint16_t adjusted_progress = progress - sizes[2];
-                  uint16_t start = sec2_start + sizes[1] - (((adjusted_progress / sec23_group_size) + 1) * sec23_group_size);
+                else if (progress < sec4_size + sec23_size) {
+                  uint16_t adj = progress - sec4_size;
+                  uint16_t start = sec2_start + sec23_size - (((adj / sec23_group_size) + 1) * sec23_group_size);
                   if (start < sec2_start) start = sec2_start;
-                  for (uint16_t i = 0; i < sec23_group_size && (start + i) < sec4_start; i++) {
-                    it[start + i] = blue_color;
-                  }
+                  for (uint16_t i = 0; i < sec23_group_size && (start + i) < sec4_start; i++)
+                    it[start + i] = plat_target;
                   progress += sec23_group_size;
                 }
                 else {
-                  // Section 1 (16 LEDs)
-                  uint16_t adjusted_progress = progress - sizes[2] - sizes[1];
-                  uint16_t start = sec1_start + sizes[0] - (((adjusted_progress / group_size) + 1) * group_size);
+                  uint16_t adj = progress - sec4_size - sec23_size;
+                  uint16_t start = sec1_start + sec1_size - (((adj / group_size) + 1) * group_size);
                   if (start < sec1_start) start = sec1_start;
-                  for (uint16_t i = 0; i < group_size && (start + i) < sec2_start; i++) {
-                    it[start + i] = target_color;
-                  }
+                  for (uint16_t i = 0; i < group_size && (start + i) < sec2_start; i++)
+                    it[start + i] = target;
                   progress += group_size;
                 }
               }

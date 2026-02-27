@@ -1,0 +1,663 @@
+################################################################################
+# Frontyard Landscape Lights - ESPHome Configuration
+# Hardware: ESP32 (esp32dev), 2x WS2811 LEDs on GPIO4
+# Framework: ESP-IDF
+#
+# ⚠ IMPORTANT — Verify LED color order before flashing:
+#   Standard WS2811 (bullet/landscape modules) = RGB order
+#   WS2812 / WS2812B = GRB order
+#   If colors appear wrong after flashing, swap rgb_order below.
+#
+# Features:
+#   - Independent per-LED color control via addressable partitions
+#   - Holiday preset select entity (automatable from Home Assistant)
+#   - Per-LED and combined holiday/seasonal effects via addressable_lambda
+#   - Custom API service for direct preset activation
+#   - saved_brightness persisted AND synced back from HA state changes
+#   - SNTP time-based auto holiday scheduling (midnight check)
+#   - Time-window on/off (configurable in the time: block below)
+#   - Smooth fade-to-black transition when switching presets
+#   - holiday_active global guards against partition write conflicts
+#   - Motion sensor stub (GPIO5, uncomment to enable)
+#
+# Required secrets.yaml keys:
+#   api_encryption_key, ota_password, wifi_ssid, wifi_password,
+#   ap_fallback_password
+################################################################################
+
+esphome:
+  name: landscape-lights
+  friendly_name: Frontyard Landscape Lights
+  on_boot:
+    priority: 600
+    then:
+      - script.execute: apply_holiday_preset
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO   # Lower to WARN in production to save memory/flash writes
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+  # Custom service: call from HA scripts/automations with preset name string
+  services:
+    - service: set_holiday_preset
+      variables:
+        preset: string
+      then:
+        # Use make_call() C++ API — consistent with rest of config
+        - lambda: |-
+            auto call = id(holiday_preset_select).make_call();
+            call.set_option(preset);
+            call.perform();
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  domain: !secret local_domain
+  manual_ip:
+    static_ip: 10.1.1.89
+    subnet: 255.255.252.0
+    dns1: 10.1.1.1
+    gateway: 10.1.1.1
+  ap:
+    ssid: "Frontyard-Landscape-Lights"
+    password: !secret ap_fallback_password   # FIX: moved from hardcoded plaintext
+
+captive_portal:
+
+mdns:
+  disabled: False
+
+# web_server disabled to reclaim ~15KB heap. Re-enable temporarily for debugging.
+# web_server:
+#   version: 3
+
+################################################################################
+# TIME — SNTP for auto-scheduling and cron-style on/off
+# Adjust timezone and on/off hours to your location and preference.
+################################################################################
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: "America/Chicago"   # ← Update to your local TZ string
+    servers:
+      - 0.pool.ntp.org
+      - 1.pool.ntp.org
+    on_time:
+      # Midnight: auto-select holiday preset based on date
+      - seconds: 0
+        minutes: 0
+        hours: 0
+        then:
+          - script.execute: auto_select_holiday
+
+      # Evening on — adjust hour to your preferred on time (or use HA automation)
+      - seconds: 0
+        minutes: 0
+        hours: 19     # 7:00 PM
+        then:
+          - script.execute: apply_holiday_preset
+
+      # Night off — lights off at 11:00 PM with slow fade
+      - seconds: 0
+        minutes: 0
+        hours: 23     # 11:00 PM
+        then:
+          - light.turn_off:
+              id: leds_both
+              transition_length: 3s
+
+################################################################################
+# GLOBALS
+################################################################################
+globals:
+  # Persisted brightness — restored on reboot AND kept in sync via on_state
+  - id: saved_brightness
+    type: float
+    restore_value: yes
+    initial_value: '0.8'
+
+  # Tracks whether a holiday effect owns the pixel buffer.
+  # Read from HA automations to guard against partition write conflicts:
+  #   do NOT drive led_1/led_2 independently while holiday_active == true.
+  - id: holiday_active
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+################################################################################
+# LIGHT ENTITIES
+#
+# Architecture:
+#   led_strip_raw  ← Internal base strip (hidden from HA)
+#       ├── led_1       Partition: index 0  → "Front LED 1"
+#       ├── led_2       Partition: index 1  → "Front LED 2"
+#       └── leds_both   Partition: 0–1      → "Front LEDs Combined"
+#
+# ⚠ SHARED BUFFER WARNING:
+#   All three partitions write to the same underlying pixel buffer.
+#   Last write wins. When a holiday effect is running on leds_both,
+#   independent control of led_1/led_2 will produce undefined visual results.
+#   Check id(holiday_active) in automations before driving led_1/led_2.
+#
+# Boot restore order:
+#   led_1 and led_2 use RESTORE_DEFAULT_OFF to prevent a three-way write
+#   conflict at boot. leds_both owns the initial state; apply_holiday_preset
+#   runs at priority 600 and sets the correct visual state.
+################################################################################
+light:
+
+  # ── Base strip (hidden from HA UI) ──────────────────────────────────────────
+  - platform: esp32_rmt_led_strip
+    id: led_strip_raw
+    internal: true
+    pin: GPIO4
+    num_leds: 2
+    # ⚠ Verify against your hardware — see note at top of file
+    chipset: WS2811
+    rgb_order: GRB
+    default_transition_length: 0s
+
+  # ── LED 1 (index 0) — independent control ───────────────────────────────────
+  - platform: partition
+    name: "Front LED 1"
+    id: led_1
+    icon: "mdi:led-on"
+    # RESTORE_DEFAULT_OFF: prevents boot write conflict with leds_both.
+    # apply_holiday_preset on_boot sets the actual initial state.
+    restore_mode: RESTORE_DEFAULT_OFF
+    default_transition_length: 500ms
+    segments:
+      - id: led_strip_raw
+        from: 0
+        to: 0
+    effects:
+      - pulse:
+          name: "Pulse Slow"
+          transition_length: 1500ms
+          min_brightness: 20%
+          max_brightness: 100%
+      - pulse:
+          name: "Pulse Fast"
+          transition_length: 300ms
+          min_brightness: 40%
+          max_brightness: 100%
+      - strobe:
+          name: "Strobe"
+          colors:
+            - state: true
+              brightness: 100%
+              duration: 80ms
+            - state: false
+              duration: 80ms
+      - flicker:
+          name: "Candle Flicker"
+          alpha: 0.94
+          intensity: 1.8%
+      - addressable_lambda:
+          name: "Color Cycle"
+          update_interval: 50ms
+          lambda: |-
+            // Hue starts at 0° for LED 1.
+            // Note: static initializer runs only on first activation.
+            // Subsequent effect restarts resume from the last hue value — this
+            // is by design for smooth continuation; reset hue here if cold-start
+            // is preferred.
+            static uint16_t hue = 0;
+            hue = (hue + 4) % 360;
+            float h = hue / 60.0f;
+            float s = 1.0f, v = 1.0f;
+            int   i = (int)h;
+            float f = h - i;
+            float p = v * (1.0f - s);
+            float q = v * (1.0f - s * f);
+            float t_val = v * (1.0f - s * (1.0f - f));
+            uint8_t r, g, b;
+            switch (i % 6) {
+              case 0: r=255*v;     g=255*t_val; b=255*p;     break;
+              case 1: r=255*q;     g=255*v;     b=255*p;     break;
+              case 2: r=255*p;     g=255*v;     b=255*t_val; break;
+              case 3: r=255*p;     g=255*q;     b=255*v;     break;
+              case 4: r=255*t_val; g=255*p;     b=255*v;     break;
+              default: r=255*v;   g=255*p;      b=255*q;     break;
+            }
+            it[0] = Color(r, g, b);
+
+  # ── LED 2 (index 1) — independent control ───────────────────────────────────
+  - platform: partition
+    name: "Front LED 2"
+    id: led_2
+    icon: "mdi:led-on"
+    restore_mode: RESTORE_DEFAULT_OFF
+    default_transition_length: 500ms
+    segments:
+      - id: led_strip_raw
+        from: 1
+        to: 1
+    effects:
+      - pulse:
+          name: "Pulse Slow"
+          transition_length: 1500ms
+          min_brightness: 20%
+          max_brightness: 100%
+      - pulse:
+          name: "Pulse Fast"
+          transition_length: 300ms
+          min_brightness: 40%
+          max_brightness: 100%
+      - strobe:
+          name: "Strobe"
+          colors:
+            - state: true
+              brightness: 100%
+              duration: 80ms
+            - state: false
+              duration: 80ms
+      - flicker:
+          name: "Candle Flicker"
+          alpha: 0.94
+          intensity: 1.8%
+      - addressable_lambda:
+          name: "Color Cycle"
+          update_interval: 50ms
+          lambda: |-
+            // Offset 180° from LED 1 for complementary color pairing.
+            // Static initializer runs only on first activation per session.
+            static uint16_t hue = 180;
+            hue = (hue + 4) % 360;
+            float h = hue / 60.0f;
+            float s = 1.0f, v = 1.0f;
+            int   i = (int)h;
+            float f = h - i;
+            float p = v * (1.0f - s);
+            float q = v * (1.0f - s * f);
+            float t_val = v * (1.0f - s * (1.0f - f));
+            uint8_t r, g, b;
+            switch (i % 6) {
+              case 0: r=255*v;     g=255*t_val; b=255*p;     break;
+              case 1: r=255*q;     g=255*v;     b=255*p;     break;
+              case 2: r=255*p;     g=255*v;     b=255*t_val; break;
+              case 3: r=255*p;     g=255*q;     b=255*v;     break;
+              case 4: r=255*t_val; g=255*p;     b=255*v;     break;
+              default: r=255*v;   g=255*p;      b=255*q;     break;
+            }
+            it[0] = Color(r, g, b);
+
+  # ── Combined (both LEDs) — holiday effects and primary control ───────────────
+  - platform: partition
+    name: "Front LEDs Combined"
+    id: leds_both
+    icon: "mdi:string-lights"
+    restore_mode: RESTORE_DEFAULT_ON
+    default_transition_length: 500ms
+    segments:
+      - id: led_strip_raw
+        from: 0
+        to: 1
+    on_state:
+      # FIX: sync saved_brightness back from HA state changes so reboots
+      # restore the user's last manually-set brightness, not the compile-time default.
+      then:
+        - lambda: |-
+            float bri = id(leds_both).current_values.get_brightness();
+            if (id(leds_both).current_values.get_state() && bri > 0.01f) {
+              id(saved_brightness) = bri;
+            }
+    effects:
+
+      # ── General ─────────────────────────────────────────────────────────────
+      - pulse:
+          name: "Pulse Slow"
+          transition_length: 2000ms
+          min_brightness: 15%
+          max_brightness: 100%
+      - addressable_rainbow:
+          name: "Rainbow"
+          speed: 15
+          width: 50
+      - addressable_lambda:
+          name: "Alternating Colors"
+          update_interval: 800ms
+          lambda: |-
+            static bool flip = false;
+            flip = !flip;
+            it[0] = flip ? Color(255, 0, 0) : Color(0, 0, 255);
+            it[1] = flip ? Color(0, 0, 255) : Color(255, 0, 0);
+
+      # ── Valentine's Day (Feb 14) — Deep reds and pinks ──────────────────────
+      - addressable_lambda:
+          name: "Holiday: Valentine's Day"
+          update_interval: 600ms
+          lambda: |-
+            static const Color palette[] = {
+              Color(220, 0,  60),
+              Color(255, 20, 120),
+              Color(180, 0,  80),
+              Color(255, 60, 140),
+            };
+            static uint8_t step = 0;
+            step = (step + 1) % 4;
+            it[0] = palette[step];
+            it[1] = palette[(step + 2) % 4];
+
+      # ── St. Patrick's Day (Mar 17) — Greens and gold ────────────────────────
+      - addressable_lambda:
+          name: "Holiday: St. Patrick's Day"
+          update_interval: 500ms
+          lambda: |-
+            static const Color palette[] = {
+              Color(0,   180, 0),
+              Color(255, 200, 0),
+              Color(255, 255, 240),
+            };
+            static uint8_t step = 0;
+            step = (step + 1) % 3;
+            it[0] = palette[step];
+            it[1] = palette[(step + 1) % 3];
+
+      # ── Easter (variable April) — Pastel spring tones ───────────────────────
+      - addressable_lambda:
+          name: "Holiday: Easter"
+          update_interval: 700ms
+          lambda: |-
+            static const Color palette[] = {
+              Color(180, 130, 255),
+              Color(255, 200, 210),
+              Color(180, 255, 180),
+              Color(255, 255, 160),
+            };
+            static uint8_t step = 0;
+            step = (step + 1) % 4;
+            it[0] = palette[step];
+            it[1] = palette[(step + 2) % 4];
+
+      # ── Independence Day (Jul 4) — Red/White/Blue fast alternating ──────────
+      - addressable_lambda:
+          name: "Holiday: Independence Day"
+          update_interval: 250ms
+          lambda: |-
+            static const Color seq[] = {
+              Color(255, 0,   0),
+              Color(255, 255, 255),
+              Color(0,   0,   200),
+              Color(255, 255, 255),
+              Color(255, 0,   0),
+              Color(0,   0,   200),
+            };
+            static uint8_t step = 0;
+            step = (step + 1) % 6;
+            it[0] = seq[step];
+            it[1] = seq[(step + 3) % 6];
+
+      # ── Halloween (Oct 31) — Flickering orange & purple ─────────────────────
+      - addressable_lambda:
+          name: "Holiday: Halloween"
+          update_interval: 120ms
+          lambda: |-
+            // FIX: floor guard now equals flip threshold so the full
+            // brightness range [60,230] and [40,180] is reachable.
+            // FIX: clamped addition prevents uint8 overflow on the upper bound.
+            static uint8_t brightness0 = 150, brightness1 = 120;
+            static bool dir0 = true, dir1 = false;
+            uint8_t step0 = (uint8_t)(esp_random() % 30);
+            uint8_t step1 = (uint8_t)(esp_random() % 30);
+
+            // Orange (LED 0): range 60–230
+            if (dir0) {
+              brightness0 = ((int)brightness0 + step0 >= 230) ? 230 : brightness0 + step0;
+              if (brightness0 >= 220) dir0 = false;
+            } else {
+              brightness0 = ((int)brightness0 - step0 <= 60) ? 60 : brightness0 - step0;
+              if (brightness0 <= 60) dir0 = true;
+            }
+            // Purple (LED 1): range 40–180
+            if (dir1) {
+              brightness1 = ((int)brightness1 + step1 >= 180) ? 180 : brightness1 + step1;
+              if (brightness1 >= 170) dir1 = false;
+            } else {
+              brightness1 = ((int)brightness1 - step1 <= 40) ? 40 : brightness1 - step1;
+              if (brightness1 <= 40) dir1 = true;
+            }
+            it[0] = Color(brightness0, brightness0 / 4, 0);
+            it[1] = Color(brightness1 / 3, 0, brightness1);
+
+      # ── Thanksgiving (4th Thu Nov) — Warm harvest palette ───────────────────
+      - addressable_lambda:
+          name: "Holiday: Thanksgiving"
+          update_interval: 800ms
+          lambda: |-
+            static const Color palette[] = {
+              Color(200, 80,  0),
+              Color(160, 100, 20),
+              Color(220, 160, 0),
+              Color(140, 60,  10),
+            };
+            static uint8_t step = 0;
+            step = (step + 1) % 4;
+            it[0] = palette[step];
+            it[1] = palette[(step + 2) % 4];
+
+      # ── Christmas (Dec 25) — Classic red/green/gold twinkle ─────────────────
+      - addressable_lambda:
+          name: "Holiday: Christmas"
+          update_interval: 400ms
+          lambda: |-
+            static const Color palette[] = {
+              Color(220, 0,   0),
+              Color(0,   180, 0),
+              Color(255, 255, 200),
+              Color(220, 0,   0),
+              Color(255, 215, 0),
+              Color(0,   180, 0),
+            };
+            static uint8_t step = 0;
+            step = (step + 1) % 6;
+            it[0] = palette[step];
+            it[1] = palette[(step + 3) % 6];
+
+      # ── New Year's Eve / Day — Sparkling gold & silver ──────────────────────
+      - addressable_lambda:
+          name: "Holiday: New Year"
+          update_interval: 100ms
+          lambda: |-
+            static const Color gold(255, 215, 0);
+            static const Color silver(180, 180, 190);
+            static const Color off_c(0, 0, 0);
+            static uint8_t step = 0;
+            step = (step + 1) % 8;
+            if      (step == 0 || step == 4) { it[0] = gold;   it[1] = silver; }
+            else if (step == 2 || step == 6) { it[0] = silver; it[1] = gold;   }
+            else                             { it[0] = off_c;  it[1] = off_c;  }
+
+################################################################################
+# BINARY SENSORS
+################################################################################
+binary_sensor:
+  # ── Motion sensor (PIR/RCWL on GPIO5) ───────────────────────────────────────
+  # Wire a PIR or mmWave sensor to GPIO5 and uncomment this block plus the
+  # motion_override script below to enable welcome-lighting on motion.
+  #
+  # - platform: gpio
+  #   pin:
+  #     number: GPIO5
+  #     mode:
+  #       input: true
+  #       pulldown: true
+  #   name: "Motion"
+  #   id: motion_sensor
+  #   device_class: motion
+  #   filters:
+  #     - delayed_off: 5s
+  #   on_press:
+  #     then:
+  #       - script.execute: motion_override
+  #   on_release:
+  #     then:
+  #       - script.execute: apply_holiday_preset
+
+################################################################################
+# SELECT — Holiday Preset Picker (HA dropdown entity)
+################################################################################
+select:
+  - platform: template
+    name: "Holiday Preset"
+    id: holiday_preset_select
+    icon: "mdi:calendar-star"
+    optimistic: true
+    restore_value: true
+    initial_option: "None"
+    options:
+      - "None"
+      - "Valentine's Day"
+      - "St. Patrick's Day"
+      - "Easter"
+      - "Independence Day"
+      - "Halloween"
+      - "Thanksgiving"
+      - "Christmas"
+      - "New Year"
+    set_action:
+      - script.execute: apply_holiday_preset
+
+################################################################################
+# SCRIPTS
+################################################################################
+script:
+
+  # ── Main preset applicator ───────────────────────────────────────────────────
+  # FIX: Collapsed from 9 sequential if-blocks to a single lambda C++ call.
+  #   - Eliminates redundant evaluations and intermediate light.turn_on calls.
+  #   - Uses make_call() API for consistent, safe state mutation.
+  #   - Updates holiday_active global so automations can guard partition conflicts.
+  #   - Adds a 400ms fade-to-black before applying the new effect for smooth
+  #     visual transitions between presets.
+  - id: apply_holiday_preset
+    mode: restart
+    then:
+      - light.turn_off:
+          id: leds_both
+          transition_length: 400ms
+      - delay: 450ms
+      - lambda: |-
+          // current_option() returns StringRef — cast to std::string for
+          // safe comparisons, c_str() logging, and set_effect() calls.
+          std::string preset = std::string(id(holiday_preset_select).current_option());
+          ESP_LOGI("preset", "Applying preset: %s", preset.c_str());
+
+          auto call = id(leds_both).make_call();
+          call.set_state(true);
+          call.set_brightness(id(saved_brightness));
+
+          if      (preset == "Valentine's Day")   { call.set_effect("Holiday: Valentine's Day");   id(holiday_active) = true;  }
+          else if (preset == "St. Patrick's Day") { call.set_effect("Holiday: St. Patrick's Day"); id(holiday_active) = true;  }
+          else if (preset == "Easter")            { call.set_effect("Holiday: Easter");             id(holiday_active) = true;  }
+          else if (preset == "Independence Day")  { call.set_effect("Holiday: Independence Day");  id(holiday_active) = true;  }
+          else if (preset == "Halloween")         { call.set_effect("Holiday: Halloween");          id(holiday_active) = true;  }
+          else if (preset == "Thanksgiving")      { call.set_effect("Holiday: Thanksgiving");       id(holiday_active) = true;  }
+          else if (preset == "Christmas")         { call.set_effect("Holiday: Christmas");          id(holiday_active) = true;  }
+          else if (preset == "New Year")          { call.set_effect("Holiday: New Year");           id(holiday_active) = true;  }
+          else {
+            // "None" — solid warm white, clears any active effect
+            call.set_effect("none");
+            call.set_rgb(1.0f, 1.0f, 1.0f);
+            id(holiday_active) = false;
+          }
+          call.perform();
+
+  # ── Auto holiday schedule (runs at midnight via SNTP on_time) ────────────────
+  # Adjust date windows below to taste. Easter uses an approximate fixed window;
+  # for a precise calculation replace with an ESPHome lambda computing
+  # the Butcher/Meeus algorithm or drive it from an HA automation instead.
+  - id: auto_select_holiday
+    mode: single
+    then:
+      - lambda: |-
+          if (!id(sntp_time).now().is_valid()) {
+            ESP_LOGW("auto_holiday", "SNTP time not yet valid — skipping auto-select");
+            return;
+          }
+          auto t     = id(sntp_time).now();
+          int month  = t.month;
+          int day    = t.day_of_month;
+          std::string preset = "None";
+
+          if      (month == 1  && day <= 3)               preset = "New Year";
+          else if (month == 2  && day >= 7  && day <= 14) preset = "Valentine's Day";
+          else if (month == 3  && day >= 10 && day <= 17) preset = "St. Patrick's Day";
+          else if (month == 4  && day >= 10 && day <= 20) preset = "Easter";        // approximate
+          else if (month == 7  && day >= 1  && day <= 4)  preset = "Independence Day";
+          else if (month == 10 && day >= 24)               preset = "Halloween";
+          else if (month == 11 && day >= 20)               preset = "Thanksgiving";
+          else if (month == 12 && day >= 1)                preset = "Christmas";
+
+          ESP_LOGI("auto_holiday", "Auto-selected: %s (%d/%d)", preset.c_str(), month, day);
+          auto call = id(holiday_preset_select).make_call();
+          call.set_option(preset);
+          call.perform();
+
+  # ── Motion override (uncomment when motion_sensor is enabled above) ──────────
+  # Temporarily overrides the holiday effect with full-brightness white for
+  # welcome/security lighting, then restores the active preset after 5 minutes.
+  #
+  # - id: motion_override
+  #   mode: restart
+  #   then:
+  #     - lambda: |-
+  #         auto call = id(leds_both).make_call();
+  #         call.set_state(true);
+  #         call.set_brightness(1.0f);
+  #         call.set_effect("none");
+  #         call.set_rgb(1.0f, 1.0f, 1.0f);
+  #         call.perform();
+  #     - delay: 5min
+  #     - script.execute: apply_holiday_preset
+
+################################################################################
+# SENSORS / DIAGNOSTICS
+################################################################################
+sensor:
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 60s
+    icon: "mdi:wifi"
+
+  - platform: uptime
+    name: "Uptime"
+    update_interval: 60s
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "IP Address"
+      icon: "mdi:ip-network"
+    ssid:
+      name: "Connected SSID"
+
+  # Exposes the currently active preset as a read-only HA sensor
+  - platform: template
+    name: "Active Holiday Preset"
+    id: active_preset_sensor
+    icon: "mdi:calendar-heart"
+    lambda: |-
+      // current_option() returns StringRef; text_sensor requires optional<std::string>
+      return std::string(id(holiday_preset_select).current_option());
+    update_interval: 30s
+
+button:
+  - platform: restart
+    name: "Restart"
+    icon: "mdi:restart"
+
+  - platform: safe_mode
+    name: "Restart (Safe Mode)"
+    icon: "mdi:shield-refresh"

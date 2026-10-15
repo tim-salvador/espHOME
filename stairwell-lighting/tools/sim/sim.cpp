@@ -450,65 +450,165 @@ static void t_wraparound() {
   CHECK(h == r.d.settings().hold_max_ms, "1 sample -> hold_max, got %u", h);
 }
 
-static void t_effect_math() {
-  printf("effect math: bounds, continuity, endpoints\n");
-  Geometry g = make_geo();
+// Checks one effect against the rules every effect must follow.
+static void check_effect(const char *label, const Effect &fx, const Geometry &g, bool on, bool incidental, Dir d,
+                         float spd) {
   const uint16_t n = g.num_pixels();
+  uint16_t mapped = 0;
+  for (uint16_t px = 0; px < n; px++) if (g.mapped(px)) mapped++;
   std::vector<float> from_on(n, 1.0f), from_off(n, 0.0f), out(n);
-  for (float spd : {0.5f, 1.0f, 2.0f}) {
-    for (int s = 0; s < static_cast<int>(Style::COUNT); s++) {
-      for (Dir d : {Dir::UP, Dir::DOWN}) {
-        for (int on = 0; on < 2; on++) {
-          const Effect &fx = on ? enter_effect(static_cast<Style>(s)) : exit_effect(static_cast<Style>(s));
-          EffectCtx c{&g, d, entry_end_of(d), 0, spd, on ? from_off.data() : from_on.data(), 42, 0};
-          uint32_t dur = fx.duration(c);
-          bool ok = true;
-          for (uint32_t t = 0; t <= dur; t += 10) {
-            c.t = t;
-            fx.render(c, out.data());
-            for (float v : out) ok &= (v >= 0.0f && v <= 1.0f && !std::isnan(v));
-          }
-          c.t = 0;
-          fx.render(c, out.data());
-          float start = 0;
-          for (float v : out) start += v;
-          c.t = dur;
-          fx.render(c, out.data());
-          float end = 0;
-          for (float v : out) end += v;
-          CHECK(ok, "%s bounds", fx.name());
-          if (on) {
-            CHECK(start < 0.6f * n, "%s %s on starts mostly dark (%.1f)", fx.name(), dir_name(d), start);
-            CHECK(end > 0.999f * n, "%s %s on ends full (%.2f/%u)", fx.name(), dir_name(d), end, n);
-          } else {
-            CHECK(start > 0.95f * n, "%s %s off starts full (%.2f)", fx.name(), dir_name(d), start);
-            CHECK(end < 0.001f * n, "%s %s off ends dark (%.3f)", fx.name(), dir_name(d), end);
-          }
+  const float *from = (on && !incidental) ? from_off.data() : from_on.data();
+  EffectCtx c{&g, d, entry_end_of(d), 0, spd, from, 42, 0};
+  const uint32_t dur = fx.duration(c);
+  const uint32_t hand = fx.handoff(c);
+  bool ok = true, unmapped_dark = true;
+  for (uint32_t t = 0; t <= dur; t += 10) {
+    c.t = t;
+    fx.render(c, out.data());
+    for (uint16_t px = 0; px < n; px++) {
+      ok &= (out[px] >= 0.0f && out[px] <= 1.0f && !std::isnan(out[px]));
+      if (!g.mapped(px)) unmapped_dark &= out[px] == 0.0f;
+    }
+  }
+  auto sum_at = [&](uint32_t t) {
+    c.t = t;
+    fx.render(c, out.data());
+    float s = 0;
+    for (uint16_t px = 0; px < n; px++)
+      if (g.mapped(px)) s += out[px];
+    return s;
+  };
+  const float start = sum_at(0), end = sum_at(dur);
+  const float m = static_cast<float>(mapped);
+  CHECK(ok, "%s: levels within [0,1], no NaN", label);
+  CHECK(unmapped_dark, "%s: unmapped pixels written as 0", label);
+  CHECK(dur > 0 && dur < 15000, "%s: sane duration %u ms", label, dur);
+  CHECK(hand <= dur, "%s: handoff %u <= duration %u", label, hand, dur);
+  if (incidental) {
+    CHECK(start > 0.95f * m, "%s: starts continuous with lit stairs (%.2f/%u)", label, start, mapped);
+    CHECK(end < 0.02f * m, "%s: ends dark (%.3f)", label, end);
+  } else if (on) {
+    CHECK(start < 0.6f * m, "%s: enter starts mostly dark (%.1f)", label, start);
+    CHECK(end > 0.999f * m, "%s: enter ends full (%.2f/%u)", label, end, mapped);
+  } else {
+    CHECK(start > 0.95f * m, "%s: exit starts full (%.2f)", label, start);
+    CHECK(end < 0.001f * m, "%s: exit ends dark (%.3f)", label, end);
+  }
+}
+
+static void t_effect_math() {
+  printf("effect math: every registered effect, full stairs and landing-only, 0.5x-2x\n");
+  Geometry full = make_geo();
+  Geometry landing;
+  landing.make_subset(full, 1, 1);
+  const EffectRegistry &reg = effects();
+  for (size_t i = 0; i < reg.size(); i++) {
+    const EffectEntry &e = reg.at(static_cast<int>(i));
+    const bool inc = e.kind == EffectKind::INCIDENTAL;
+    CHECK(e.enter != nullptr && (inc || e.exit != nullptr), "%s: has its variants", e.name);
+    for (const Geometry *g : {&full, &landing}) {
+      for (float spd : {0.5f, 1.0f, 2.0f}) {
+        for (Dir d : {Dir::UP, Dir::DOWN}) {
+          char label[64];
+          snprintf(label, sizeof(label), "%s %s %s %.1fx", e.name, g == &full ? "full" : "landing", dir_name(d),
+                   static_cast<double>(spd));
+          check_effect(label, *e.enter, *g, true, inc, d, spd);
+          if (!inc) check_effect(label, *e.exit, *g, false, false, d, spd);
         }
       }
     }
-    for (int s = 0; s < static_cast<int>(IncidentalStyle::COUNT); s++) {
-      const Effect &fx = incidental_effect(static_cast<IncidentalStyle>(s));
-      EffectCtx c{&g, Dir::UP, End::LOWER, 0, spd, from_on.data(), 7, 0};
-      uint32_t dur = fx.duration(c);
-      bool ok = true;
-      for (uint32_t t = 0; t <= dur; t += 10) {
-        c.t = t;
-        fx.render(c, out.data());
-        for (float v : out) ok &= (v >= 0.0f && v <= 1.0f && !std::isnan(v));
-      }
-      c.t = 0;
-      fx.render(c, out.data());
-      float start = 0;
-      for (float v : out) start += v;
-      c.t = dur;
-      fx.render(c, out.data());
-      float end = 0;
-      for (float v : out) end += v;
-      CHECK(ok, "%s bounds", fx.name());
-      CHECK(start > 0.95f * n, "%s continuous with lit stairs (%.2f)", fx.name(), start);
-      CHECK(end < 0.02f * n, "%s ends dark (%.3f)", fx.name(), end);
+  }
+}
+
+static void t_registry() {
+  printf("registry and name-based selection\n");
+  const EffectRegistry &reg = effects();
+  for (size_t i = 0; i < reg.size(); i++)
+    for (size_t j = i + 1; j < reg.size(); j++)
+      CHECK(strcmp(reg.at(static_cast<int>(i)).name, reg.at(static_cast<int>(j)).name) != 0, "duplicate name %s",
+            reg.at(static_cast<int>(i)).name);
+  CHECK(strcmp(reg.at(reg.first(EffectKind::TRAVERSAL)).name, "Cascade") == 0, "default traversal is Cascade");
+  CHECK(strcmp(reg.at(reg.first(EffectKind::INCIDENTAL)).name, "Retreat") == 0, "default incidental is Retreat");
+  const char *yaml_traversal[] = {"Cascade", "Soft Wipe", "Comet", "Fade", "Glitch", "Stagger", "Scatter"};
+  const char *yaml_incidental[] = {"Retreat", "Firefly", "Ripple", "Breath", "Peek", "Sonar"};
+  for (const char *nm : yaml_traversal) CHECK(reg.find(EffectKind::TRAVERSAL, nm) >= 0, "YAML option %s registered", nm);
+  for (const char *nm : yaml_incidental)
+    CHECK(reg.find(EffectKind::INCIDENTAL, nm) >= 0, "YAML option %s registered", nm);
+  CHECK(reg.find(EffectKind::TRAVERSAL, "Peek") < 0, "kinds are separate");
+
+  Rig r;
+  CHECK(r.d.select_effect(Director::Slot::UP, "Glitch", 6), "select by name");
+  CHECK(strcmp(reg.at(r.d.settings().fx_up).name, "Glitch") == 0, "up is Glitch");
+  CHECK(!r.d.select_effect(Director::Slot::UP, "Nope", 4), "unknown rejected");
+  CHECK(strcmp(reg.at(r.d.settings().fx_up).name, "Glitch") == 0, "unknown leaves selection unchanged");
+  CHECK(!r.d.select_effect(Director::Slot::INCIDENTAL, "Glitch", 6), "wrong kind rejected");
+  CHECK(r.d.select_section_effect(1, "Stagger", 7) && r.d.settings().section_fx[1] >= 0, "section override set");
+  CHECK(r.d.select_section_effect(1, "Follow Action", 13) && r.d.settings().section_fx[1] == -1,
+        "Follow Action clears");
+  // StringRef-style: not NUL-terminated at len.
+  const char buf[] = "Sonarxyz";
+  CHECK(r.d.select_effect(Director::Slot::INCIDENTAL, buf, 5), "length-bounded name match");
+}
+
+// Mean level of a section's mapped pixels.
+static float section_mean(const Rig &r, uint8_t sec) {
+  float s = 0;
+  int k = 0;
+  for (uint16_t px = 0; px < r.geo.num_pixels(); px++)
+    if (r.geo.section_of(px) == sec) {
+      s += r.lv[px];
+      k++;
     }
+  return k ? s / static_cast<float>(k) : 0.0f;
+}
+
+static void t_relay() {
+  printf("relay: landing override hands off in the direction of travel\n");
+  {
+    Rig r;
+    r.d.select_section_effect(1, "Stagger", 7);
+    r.sensor(End::LOWER, true);  // up: lower flight (Cascade) -> landing (Stagger) -> upper (Cascade)
+    r.advance(300);
+    CHECK(section_mean(r, 0) > 0.05f, "lower flight starts first (%.2f)", section_mean(r, 0));
+    CHECK(section_mean(r, 1) < 0.01f && section_mean(r, 2) < 0.01f, "landing and upper wait (%.2f, %.2f)",
+          section_mean(r, 1), section_mean(r, 2));
+    r.advance(900);  // past the lower flight hand-off (8 steps x 110 ms)
+    CHECK(section_mean(r, 1) > 0.05f, "landing picks up after hand-off (%.2f)", section_mean(r, 1));
+    CHECK(r.run_until_phase(Phase::HOLD, 8000) != UINT32_MAX, "relay completes");
+    r.advance(40);
+    CHECK(section_mean(r, 0) > 0.999f && section_mean(r, 1) > 0.999f && section_mean(r, 2) > 0.999f,
+          "all sections full at hold");
+    r.advance(1500);
+    r.sensor(End::LOWER, false);
+    r.advance(4000);
+    r.sensor(End::UPPER, true);
+    r.advance(1000);
+    r.sensor(End::UPPER, false);
+    CHECK(r.run_until_phase(Phase::EXIT, 4000) != UINT32_MAX, "exit starts");
+    r.advance(300);
+    CHECK(section_mean(r, 0) < 0.99f && section_mean(r, 2) > 0.99f, "exit relay also runs bottom to top");
+    CHECK(r.run_until_phase(Phase::IDLE, 10000) != UINT32_MAX, "exit relay completes");
+    r.advance(40);
+    CHECK(r.level_sum() == 0.0f, "dark after exit relay");
+  }
+  {
+    Rig r;
+    r.d.select_section_effect(1, "Glitch", 6);
+    r.sensor(End::UPPER, true);  // down: upper first
+    r.advance(250);
+    CHECK(section_mean(r, 2) > 0.05f && section_mean(r, 0) < 0.01f, "down relay starts at the top (%.2f, %.2f)",
+          section_mean(r, 2), section_mean(r, 0));
+    CHECK(r.run_until_phase(Phase::HOLD, 8000) != UINT32_MAX, "down relay completes");
+  }
+  {
+    Rig r;
+    r.d.select_section_effect(1, "Cascade", 7);  // override equal to the action: one continuous run
+    r.sensor(End::LOWER, true);
+    uint32_t a = r.run_until_phase(Phase::HOLD, 8000);
+    Rig r2;
+    r2.sensor(End::LOWER, true);
+    uint32_t b = r2.run_until_phase(Phase::HOLD, 8000);
+    CHECK(a == b, "override matching the action is identical to no override (%u vs %u)", a, b);
   }
 }
 
@@ -579,6 +679,8 @@ int main(int argc, char **argv) {
   t_geometry();
   t_compose();
   t_effect_math();
+  t_registry();
+  t_relay();
   t_up_traversal();
   t_down_traversal();
   t_incidental_unlearned();
@@ -599,13 +701,16 @@ int main(int argc, char **argv) {
   t_wraparound();
 
   if (g_show) {
-    for (int s = 0; s < static_cast<int>(Style::COUNT); s++) {
-      show(enter_effect(static_cast<Style>(s)).name(), enter_effect(static_cast<Style>(s)), Dir::UP, End::LOWER, false);
-      show("  exit", exit_effect(static_cast<Style>(s)), Dir::UP, End::LOWER, true);
+    const EffectRegistry &reg = effects();
+    for (size_t i = 0; i < reg.size(); i++) {
+      const EffectEntry &e = reg.at(static_cast<int>(i));
+      if (e.kind == EffectKind::TRAVERSAL) {
+        show(e.name, *e.enter, Dir::UP, End::LOWER, false);
+        show("  exit", *e.exit, Dir::UP, End::LOWER, true);
+      } else {
+        show(e.name, *e.enter, Dir::UP, End::LOWER, true);
+      }
     }
-    for (int s = 0; s < static_cast<int>(IncidentalStyle::COUNT); s++)
-      show(incidental_effect(static_cast<IncidentalStyle>(s)).name(),
-           incidental_effect(static_cast<IncidentalStyle>(s)), Dir::UP, End::LOWER, true);
   }
 
   printf("\n%d passed, %d failed\n", g_pass, g_fail);

@@ -114,18 +114,18 @@ void StairEngine::set_section_color(uint8_t section, float r, float g, float b, 
   this->dir_.preview(section, millis());
 }
 
-void StairEngine::set_up_effect(size_t index) {
-  if (index < static_cast<size_t>(stair::Style::COUNT)) this->dir_.settings().style_up = static_cast<stair::Style>(index);
+void StairEngine::select_(stair::Director::Slot slot, const char *name, size_t len) {
+  if (!this->dir_.select_effect(slot, name, len)) {
+    ESP_LOGW(TAG, "Unknown %s effect '%.*s' (see the effect list in the boot log); keeping the current one",
+             slot == stair::Director::Slot::INCIDENTAL ? "incidental" : "traversal", static_cast<int>(len), name);
+  }
 }
 
-void StairEngine::set_down_effect(size_t index) {
-  if (index < static_cast<size_t>(stair::Style::COUNT))
-    this->dir_.settings().style_down = static_cast<stair::Style>(index);
-}
-
-void StairEngine::set_incidental_effect(size_t index) {
-  if (index < static_cast<size_t>(stair::IncidentalStyle::COUNT))
-    this->dir_.settings().incidental = static_cast<stair::IncidentalStyle>(index);
+void StairEngine::set_section_effect(uint8_t section, const char *name, size_t len) {
+  if (!this->dir_.select_section_effect(section, name, len)) {
+    ESP_LOGW(TAG, "Unknown section effect '%.*s' for section %u; keeping the current one", static_cast<int>(len),
+             name, section);
+  }
 }
 
 void StairEngine::simulate_(stair::SimAction a) {
@@ -154,6 +154,19 @@ void StairEngine::dump_config() {
   }
   ESP_LOGCONFIG(TAG, "  Learned samples: up=%u down=%u", this->dir_.learned_count(stair::Dir::UP),
                 this->dir_.learned_count(stair::Dir::DOWN));
+  const stair::EffectRegistry &reg = stair::effects();
+  const stair::Settings &st = this->dir_.settings();
+  ESP_LOGCONFIG(TAG, "  Effects (select option text must match exactly):");
+  for (size_t i = 0; i < reg.size(); i++) {
+    const stair::EffectEntry &e = reg.at(static_cast<int>(i));
+    ESP_LOGCONFIG(TAG, "    %-11s %s%s%s%s", e.kind == stair::EffectKind::TRAVERSAL ? "traversal" : "incidental",
+                  e.name, static_cast<int>(i) == st.fx_up ? "  [up]" : "", static_cast<int>(i) == st.fx_down ? "  [down]" : "",
+                  static_cast<int>(i) == st.fx_incidental ? "  [incidental]" : "");
+  }
+  for (uint8_t i = 0; i < this->geo_.num_sections(); i++) {
+    if (st.section_fx[i] >= 0)
+      ESP_LOGCONFIG(TAG, "  Relay override: %s -> %s", this->geo_.section(i).name, reg.at(st.section_fx[i]).name);
+  }
 }
 
 }  // namespace stair_engine

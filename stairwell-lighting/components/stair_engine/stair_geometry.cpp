@@ -72,4 +72,14 @@ bool Geometry::finalize() {
   return true;
 }
 
+bool Geometry::make_subset(const Geometry &full, uint8_t first, uint8_t count) {
+  this->sections_.clear();
+  this->num_pixels_ = full.num_pixels();
+  for (uint8_t i = first; i < first + count && i < full.num_sections(); i++) {
+    const SectionDef &s = full.section(i);
+    this->add_section(s.name, s.first_pixel, s.pixels, s.pixels_per_step, s.reversed);
+  }
+  return this->finalize();
+}
+
 }  // namespace stair

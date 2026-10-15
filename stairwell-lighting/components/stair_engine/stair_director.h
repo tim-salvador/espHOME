@@ -17,6 +17,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <memory>
 #include <vector>
 #include "stair_effects.h"
 #include "stair_geometry.h"
@@ -47,9 +48,13 @@ struct Settings {
   uint32_t stuck_ms{300000};        // continuously active this long = stuck fault
   // Look
   float speed{1.0f};
-  Style style_up{Style::CASCADE};
-  Style style_down{Style::CASCADE};
-  IncidentalStyle incidental{IncidentalStyle::RETREAT};
+  // Effect choices are indices into effects() (the registry). Set them by name
+  // through Director::select_effect(); attach() initializes them to the defaults.
+  int16_t fx_up{-1};
+  int16_t fx_down{-1};
+  int16_t fx_incidental{-1};
+  // Per-section traversal override for relays; -1 = follow the action's effect.
+  int16_t section_fx[MAX_SECTIONS]{-1, -1, -1, -1, -1, -1, -1, -1};
   // Preview
   uint32_t preview_ms{5000};
   // Ambient gating (blocks NEW activations only)
@@ -81,6 +86,13 @@ class Director {
   void preview(uint8_t section, uint32_t now);
   bool simulate(SimAction a, uint32_t now);
   void set_ambient_lux(float lux) { this->lux_ = lux; }
+
+  // ---- effect selection by registry name. Returns false (and changes nothing) if
+  // the name is not a registered effect of the right kind.
+  enum class Slot : uint8_t { UP, DOWN, INCIDENTAL };
+  bool select_effect(Slot slot, const char *name, size_t len);
+  // Section override: "Follow Action" (or empty) clears it.
+  bool select_section_effect(uint8_t section, const char *name, size_t len);
 
   // ---- runtime
   void tick(uint32_t now);
@@ -146,7 +158,14 @@ class Director {
   bool booting_(uint32_t now) const;
   bool gated_() const;
   void arrival_(End e, uint32_t now);
+  // One effect over the whole staircase.
   void start_(Phase p, const Effect *fx, uint32_t now, Dir dir, End origin, float param = 0.0f);
+  // Traversal (enter or exit) as a relay across sections, honoring section overrides.
+  void start_traversal_(Phase p, bool enter, uint32_t now, Dir dir, End origin);
+  void begin_phase_(Phase p, uint32_t now, Dir dir, End origin, float param);
+  EffectCtx ctx_(const Geometry *g, uint32_t t, size_t seg) const;
+  const Geometry *subset_(uint8_t first, uint8_t count);
+  int16_t traversal_fx_(Dir d) const { return d == Dir::UP ? this->s_.fx_up : this->s_.fx_down; }
   void to_idle_(uint32_t now);
   void restore_(uint32_t now);
   void record_sample_(Dir d, uint32_t sample_ms);
@@ -161,7 +180,19 @@ class Director {
   const Geometry *geo_{nullptr};
   Settings s_;
   Phase phase_{Phase::IDLE};
-  const Effect *fx_{nullptr};
+  struct Segment {
+    const Geometry *geo;
+    const Effect *fx;
+    uint32_t start;
+  };
+  std::vector<Segment> plan_;  // empty = no effect (idle/hold)
+  uint32_t plan_dur_{0};
+  struct SubGeo {
+    uint8_t first, count;
+    std::unique_ptr<Geometry> geo;
+  };
+  std::vector<SubGeo> sub_cache_;
+  std::vector<float> tmp_;
   uint32_t phase_start_{0};
   Dir dir_{Dir::UP};
   End origin_{End::LOWER};

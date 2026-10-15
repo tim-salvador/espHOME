@@ -1,5 +1,5 @@
 # ==============================================================================
-# Stairwell Lighting v3.1 (stair_engine): dual-target ESP8266 / ESP32
+# Stairwell Lighting v3.2 (stair_engine): dual-target ESP8266 / ESP32
 #
 #   board:             esp8266 (NodeMCU v1.0 / ESP-12E, the installed unit) | esp32
 #   storage_installed: false until the storage-room PIR + white strip are wired
@@ -438,38 +438,51 @@ text_sensor:
 
 # ------------------------------------------------------------------------------
 # Effects per action
-# Option ORDER is the contract with the engine (Style / IncidentalStyle enums).
+# Options are matched to the engine's effect registry BY NAME (order is free).
+# The boot log lists every registered effect; unknown names log a warning.
 # ------------------------------------------------------------------------------
 select:
   - platform: template
     name: Up Effect
     icon: mdi:stairs-up
-    options: [Cascade, Soft Wipe, Comet, Fade]
+    options: [Cascade, Soft Wipe, Comet, Fade, Glitch, Stagger, Scatter]
     initial_option: Cascade
     optimistic: true
     restore_value: true
     on_value:
-      - lambda: id(stairs).set_up_effect(i);
+      - lambda: id(stairs).set_up_effect(x.c_str(), x.size());
 
   - platform: template
     name: Down Effect
     icon: mdi:stairs-down
-    options: [Cascade, Soft Wipe, Comet, Fade]
+    options: [Cascade, Soft Wipe, Comet, Fade, Glitch, Stagger, Scatter]
     initial_option: Cascade
     optimistic: true
     restore_value: true
     on_value:
-      - lambda: id(stairs).set_down_effect(i);
+      - lambda: id(stairs).set_down_effect(x.c_str(), x.size());
 
   - platform: template
     name: Incidental Effect
     icon: mdi:shimmer
-    options: [Retreat, Firefly, Ripple, Breath]
+    options: [Retreat, Firefly, Ripple, Breath, Peek, Sonar]
     initial_option: Retreat
     optimistic: true
     restore_value: true
     on_value:
-      - lambda: id(stairs).set_incidental_effect(i);
+      - lambda: id(stairs).set_incidental_effect(x.c_str(), x.size());
+
+  # Relay: the action's effect carries you to the landing, the landing runs its
+  # own effect, then hands back. "Follow Action" = no override. Section 1 = Landing.
+  - platform: template
+    name: Landing Effect
+    icon: mdi:stairs-box
+    options: [Follow Action, Cascade, Soft Wipe, Comet, Fade, Glitch, Stagger, Scatter]
+    initial_option: Follow Action
+    optimistic: true
+    restore_value: true
+    on_value:
+      - lambda: id(stairs).set_section_effect(1, x.c_str(), x.size());
 
 # ------------------------------------------------------------------------------
 # Tunables

@@ -10,9 +10,9 @@ color, every action has its own effect, and the hold time learns how long your
 household actually takes on the stairs.
 
 All behavior lives in a small C++ engine that compiles and runs on a PC for
-testing (271 automated checks), then runs unchanged on an ESP8266 or ESP32.
+testing (1,658 automated checks), then runs unchanged on an ESP8266 or ESP32.
 
-![version](https://img.shields.io/badge/version-3.1-blue) ![esphome](https://img.shields.io/badge/ESPHome-%E2%89%A52026.9.0-black) ![boards](https://img.shields.io/badge/boards-ESP8266%20%7C%20ESP32-green)
+![version](https://img.shields.io/badge/version-3.2.1-blue) ![esphome](https://img.shields.io/badge/ESPHome-%E2%89%A52026.9.0-black) ![boards](https://img.shields.io/badge/boards-ESP8266%20%7C%20ESP32-green)
 
 ---
 
@@ -26,12 +26,14 @@ testing (271 automated checks), then runs unchanged on an ESP8266 or ESP32.
 - [Build and flash](#build-and-flash)
 - [Home Assistant / Web UI settings](#home-assistant--web-ui-settings)
 - [Effects](#effects)
+- [Relay (landing effect)](#relay-landing-effect)
 - [Using it](#using-it)
 - [Why it is built this way](#why-it-is-built-this-way)
 - [Troubleshooting](#troubleshooting)
 - [Testing](#testing)
 - [Project files](#project-files)
 - [Extending](#extending)
+- [Future effects and ambient mode](#future-effects-and-ambient-mode)
 - [Known limits](#known-limits)
 - [Roadmap](#roadmap)
 - [Changelog](#changelog)
@@ -46,8 +48,15 @@ testing (271 automated checks), then runs unchanged on an ESP8266 or ESP32.
   install uses three: lower flight, landing, upper flight. Up to 8 are supported.
 - **Live per-section color** from a Home Assistant color wheel. Changing a color
   lights just that section for 5 seconds so you can see it in place.
-- **Effect per action** from a dropdown. Effects never contain colors; they only
+- **Effect per action** from a dropdown: 7 traversal effects (Cascade, Soft Wipe,
+  Comet, Fade, Glitch, Stagger, Scatter) and 6 incidental effects (Retreat,
+  Firefly, Ripple, Breath, Peek, Sonar). Effects never contain colors; they only
   shape brightness, and color always comes from the section.
+- **Relay landing effect:** the landing can run its own effect. The action's
+  effect carries you to the landing, hands off, and takes back over for the
+  next flight, in your direction of travel.
+- **Custom effects in one file:** effects register by name, so adding one means
+  editing `stair_effects_custom.cpp` and adding its name to a dropdown.
 - **Hold until confirmed:** lights stay on until the person is seen arriving at
   the other end. No fixed timer turns the lights off on a slow climber.
 - **Learned backstop:** for trips that never complete (turn-backs, false
@@ -78,7 +87,8 @@ flowchart LR
     end
     subgraph Engine["stair_engine (C++)"]
         DIR[Director<br/>state machine<br/>trip tracking<br/>learning, faults]
-        FX[Effects<br/>brightness only]
+        REG[Effect registry<br/>built-in + custom]
+        FX[Effects via relay<br/>brightness only]
         CMP[Compositor<br/>brightness x section color]
     end
     PL --> DIR
@@ -86,6 +96,7 @@ flowchart LR
     LX --> DIR
     UI --> DIR
     UI --> CMP
+    REG --> FX
     DIR --> FX --> CMP
     CMP --> DRV[LED driver<br/>RMT or NeoPixelBus]
     DRV --> LS[74AHCT125<br/>3.3 V to 5 V]
@@ -156,7 +167,7 @@ automatically after 10 quiet minutes, or with the Clear Sensor Faults button.
 
 ## Hardware
 
-### Installed controller (v3.1)
+### Installed controller
 
 | Part | Notes |
 |---|---|
@@ -438,10 +449,18 @@ Examples:
 
 | Entity | Options | Example |
 |---|---|---|
-| Up Effect | Cascade, Soft Wipe, Comet, Fade | Comet for a playful climb |
-| Down Effect | Cascade, Soft Wipe, Comet, Fade | Soft Wipe for a calm descent |
-| Incidental Effect | Retreat, Firefly, Ripple, Breath | Firefly for the cat's 3 a.m. visits |
+| Up Effect | Cascade, Soft Wipe, Comet, Fade, Glitch, Stagger, Scatter | Comet for a playful climb |
+| Down Effect | same as Up | Soft Wipe for a calm descent |
+| Incidental Effect | Retreat, Firefly, Ripple, Breath, Peek, Sonar | Peek for the cat's 3 a.m. visits |
+| Landing Effect | Follow Action, or any Up/Down effect | Stagger on the landing, Cascade on the flights |
 | Effect Speed | 25 to 200 % | 150 % makes every effect 1.5x faster |
+
+Examples:
+- Cascade up the flights with a Glitch landing: Up Effect = Cascade, Landing
+  Effect = Glitch. Climbing, the cascade reaches the landing, the landing
+  glitches on, and the cascade resumes up the top flight.
+- Same look in both directions: set Up and Down to the same effect and leave
+  Landing Effect on Follow Action.
 
 ### Timing and behavior
 
@@ -494,31 +513,73 @@ Simulations are refused while the stairs are in use and never train learning.
 
 Effects output brightness only. Color is applied afterward from each section,
 so every effect works with any color scheme. Durations are at 100 % speed on
-this 15-step layout.
+this 15-step layout; Effect Speed scales them.
 
-### Up / Down
+### Up / Down (traversal)
 
-Each has a matching exit that turns the stairs off following your direction.
+Each traversal effect has an **enter** (light up in your direction of travel)
+and a matching **exit** (turn off behind you, in the same direction).
 
 | Effect | Look | Duration |
 |---|---|---|
-| Cascade | steps light one after another with a soft fade | about 1.9 s |
-| Soft Wipe | a smooth, soft-edged front sweeps along the stairs | about 1.4 s |
-| Comet | a bright head runs ahead, the trail settles from dim to full | about 1.8 s |
+| Cascade | steps light one after another, each with a soft fade | 1.9 s |
+| Soft Wipe | a smooth, soft-edged front sweeps along the stairs | 1.5 s |
+| Comet | a bright head runs ahead; the trail settles from dim to full | 1.8 s (exit 1.4 s) |
 | Fade | the whole staircase fades together | 0.8 s |
+| Glitch | each step flickers like a bad signal, faster as it "locks on", then snaps solid; now and then a block of steps tears (flashes) together. Exit stutters and drops out | 2.1 s |
+| Stagger | every other step lights first, like footprints, then a second wave fills the gaps. Exit turns off in the same two waves | 2.2 s |
+| Scatter | steps light out of order with random delays, but the light still flows your way; pixels within a step sparkle in slightly apart | 1.8 s |
 
 ### Incidental
 
-These start from whatever is lit and end dark.
+Incidental effects start from whatever is lit (normally the dimmed grace level)
+and end dark.
 
-| Effect | Look |
-|---|---|
-| Retreat | a brief "looking around" shimmer, then the light withdraws toward where the trigger came from |
-| Firefly | pixels drift into a twinkle and wink out one by one |
-| Ripple | a decaying wave rolls away from the trigger end |
-| Breath | the staircase exhales, takes a small breath, and fades |
+| Effect | Look | Duration |
+|---|---|---|
+| Retreat | a brief "looking around" shimmer, then the light withdraws toward the trigger end | 1.7 s |
+| Firefly | pixels drift into a twinkle and wink out one by one | 2.4 s |
+| Ripple | a decaying wave rolls away from the trigger end | 2.1 s |
+| Breath | the staircase exhales, takes a small breath, and fades | 2.9 s |
+| Peek | the stairs fall away except a small glow near the trigger end, which pulses softly twice and fades. Subtle; good for pets | 2.4 s |
+| Sonar | the stairs fade while one soft pulse travels from the trigger end to the far end, weakening as it goes | 2.0 s |
 
 Run `make show` in `tools/sim` to see ASCII frames of every effect.
+
+---
+
+## Relay (landing effect)
+
+The landing can run its own effect while the flights use the action's effect.
+The effects pass the light along like a relay baton, in the direction you walk:
+
+```mermaid
+flowchart LR
+    A[Lower flight<br/>action effect] -- hand-off --> B[Landing<br/>Landing Effect] -- hand-off --> C[Upper flight<br/>action effect]
+```
+
+Going down, the order reverses: upper flight, landing, lower flight. Exits relay
+the same way, so the off-wave also changes character as it crosses the landing.
+
+**Hand-off timing.** Each effect reports when it should pass the baton. Effects
+with a moving front (Cascade, Soft Wipe, Comet, Glitch, Scatter) hand off when
+the front reaches the far edge of their section, so the motion continues
+without a gap. Stagger hands off when its first wave reaches the far edge. Fade
+hands off halfway through. Before its turn, a section simply holds its current
+level.
+
+**Why the landing.** Its steps are 9 pixels wide versus 2 on the flights, so
+effects with texture inside a step (Glitch's dropout, Scatter's sparkle,
+Stagger's footprints) read best there.
+
+**Rules.**
+- Landing Effect = Follow Action means no relay: the action's effect runs over
+  the whole staircase in one continuous sweep.
+- Choosing the same effect as the action is identical to Follow Action.
+- Incidental effects always run across the whole staircase (no relay), because
+  they start from whatever is lit, not from dark.
+- The engine supports an override on any section. Only the landing is exposed
+  in the YAML; see [Extending](#extending) to add others.
 
 ---
 
@@ -637,6 +698,7 @@ regulator, because the AM312 draws almost nothing.
 | OTA fails with "not enough space" | first update from v2's 1 MB layout | flash once over USB |
 | Log says `Lit but no frames rendered` | strip light not running the Engine effect | reboot; the effect is started at boot |
 | Colors look wrong | channel order | the stair strip is BRG; adjust `type:` or `channel_colors:` |
+| Log warns `Unknown traversal effect` | a select option does not match a registered name | compare with the effect list printed in the boot log (exact, case-sensitive) |
 
 To tell a bad GPIO from a bad sensor, swap the two PIR signal wires at the
 board. If the problem follows the wire, it is the sensor or cable. If it stays
@@ -654,18 +716,21 @@ make          # build with -Wall -Wextra -Wconversion -Werror and run all checks
 make show     # also print ASCII frames of every effect
 ```
 
-271 checks cover: up and down trips, the slow climber, the incidental path,
+1,658 checks cover: up and down trips, the slow climber, the incidental path,
 learned hold, grace restore, boot settle, ambient gating, PIR chatter, two
 people, crossing traffic, the false-trigger pattern from a real field log,
 stuck sensors, faulted sensors still waking dark stairs, color preview,
-simulation, `millis()` rollover, and every effect's bounds and continuity at
-0.5x to 2x speed.
+simulation, `millis()` rollover, the effect registry and name selection, relay
+order and hand-off in both directions, and every registered effect (on the
+whole staircase and on the landing alone, both directions, 0.5x to 2x speed)
+against the effect rules: levels within 0 to 1, unmapped pixels dark, a
+seamless start, and an exact final frame.
 
 Validation status of this release:
 
 | Check | Status |
 |---|---|
-| Host tests | 271 / 271 pass |
+| Host tests | 1,658 / 1,658 pass |
 | `esphome config` (ESP8266 and ESP32, storage on and off) | valid on 2026.9.1 |
 | Glue code against ESPHome 2026.9.1 headers | compiles (syntax check) |
 | Full firmware compile | run `esphome compile` locally |
@@ -684,8 +749,11 @@ Validation status of this release:
 │   └── stair_engine/
 │       ├── __init__.py            ESPHome schema, layout validation, code generation
 │       ├── stair_engine.h/.cpp    ESPHome glue (the only ESPHome-dependent code)
-│       ├── stair_director.h/.cpp  state machine, trip tracking, learning, faults, simulation
-│       ├── stair_effects.h/.cpp   effects (brightness only)
+│       ├── stair_director.h/.cpp  state machine, trip tracking, relay, learning, faults, simulation
+│       ├── stair_effects.h        effect interface and registry
+│       ├── stair_effect_util.h    helpers for writing effects (smooth, lerp, rand01, ms)
+│       ├── stair_effects_builtin.cpp  built-in effects and the registry
+│       ├── stair_effects_custom.cpp   your effects: Glitch, Stagger, Scatter, Peek, Sonar, ...
 │       ├── stair_geometry.h/.cpp  sections, steps, pixel positions
 │       └── stair_compose.h        brightness x section color
 └── tools/
@@ -727,13 +795,115 @@ Rules, checked at compile time: `pixels` must be a multiple of
 most 8 sections. Each section needs a color light whose
 `set_section_color(N, ...)` index matches its position in the list.
 
+### Relay overrides for other sections
+
+The engine accepts an override for any section. To expose one, copy the
+Landing Effect select and change the section index (0 = first section listed):
+
+```yaml
+  - platform: template
+    name: Upper Flight Effect
+    options: [Follow Action, Cascade, Soft Wipe, Comet, Fade, Glitch, Stagger, Scatter]
+    initial_option: Follow Action
+    optimistic: true
+    restore_value: true
+    on_value:
+      - lambda: id(stairs).set_section_effect(2, x.c_str(), x.size());
+```
+
 ### Add an effect
 
-1. Implement a class in `stair_effects.cpp` with `name()`, `duration()` and
-   `render()`. Write brightness in [0, 1] per pixel; there is no color to set.
-2. Add it to the `Style` or `IncidentalStyle` enum and the matching switch.
-3. Add its name to the select's `options:` **in the same position** as the enum.
-4. Add a case to `t_effect_math` and run `make`.
+Effects live in two files. Leave `stair_effects_builtin.cpp` alone; put yours in
+**`stair_effects_custom.cpp`**. Effects are looked up by name, so there is no
+enum or ordering to keep in sync.
+
+**1. Write the class.** Traversal effects take an `on` flag so one class
+provides both enter and exit:
+
+```cpp
+// Stagger: every other step lights first, then a second wave fills the gaps.
+class Stagger final : public Effect {
+ public:
+  explicit Stagger(bool on) : on_(on) {}
+  const char *name() const override { return "Stagger"; }
+
+  uint32_t duration(const EffectCtx &c) const override {
+    return static_cast<uint32_t>(2.0f * half(c) * gap(c) + fade(c));
+  }
+  // Relay hand-off: when the first wave reaches the far edge.
+  uint32_t handoff(const EffectCtx &c) const override {
+    return static_cast<uint32_t>(half(c) * gap(c));
+  }
+
+  void render(const EffectCtx &c, float *out) const override {
+    const float t = static_cast<float>(c.t);
+    for (uint16_t px = 0; px < n_px(c); px++) {
+      if (!c.geo->mapped(px)) { out[px] = 0.0f; continue; }
+      const uint16_t k = c.geo->step_along(px, c.dir);  // step count in travel order
+      const float start = (k % 2 == 0 ? 0.0f : half(c) * gap(c)) + static_cast<float>(k / 2) * gap(c);
+      out[px] = toward(c, px, this->on_, smooth((t - start) / fade(c)));
+    }
+  }
+
+ private:
+  float half(const EffectCtx &c) const { return std::ceil(n_steps(c) / 2.0f); }
+  float gap(const EffectCtx &c) const { return ms(120.0f, c.speed); }   // scales with Effect Speed
+  float fade(const EffectCtx &c) const { return ms(300.0f, c.speed); }
+  bool on_;
+};
+
+const Stagger STAGGER_ON(true), STAGGER_OFF(false);
+```
+
+**2. Register it** in `register_custom_effects()` at the bottom of the file:
+
+```cpp
+reg.add_traversal("Stagger", &STAGGER_ON, &STAGGER_OFF);   // Up/Down/Landing effect
+reg.add_incidental("Sonar", &SONAR);                       // Incidental effect
+```
+
+**3. Add the name to the YAML** select options, spelled exactly as registered:
+Up Effect, Down Effect and Landing Effect for traversal effects; Incidental
+Effect for incidental ones. Order does not matter.
+
+**4. Test it.** `make` in `tools/sim` runs the rule checks on every registered
+effect automatically, with no test changes. `make show` prints its frames.
+
+**5. Build and flash.** The boot log lists every registered effect and which
+ones are selected.
+
+#### What an effect gets (`EffectCtx`)
+
+| Field | Meaning |
+|---|---|
+| `geo` | geometry: pixels, steps, positions. In a relay this is one section only |
+| `dir` | direction of travel (`Dir::UP` / `Dir::DOWN`) |
+| `origin` | end where the activity started (incidental effects grow from here) |
+| `t` | ms since this effect started |
+| `speed` | Effect Speed as a multiplier; use `ms(base, c.speed)` |
+| `from` | levels on the stairs when the effect started (start from these) |
+| `seed` | random seed for this run; use `rand01(c.seed, index, salt)` |
+
+#### Useful geometry calls
+
+| Call | Returns |
+|---|---|
+| `c.geo->mapped(px)` | whether the pixel belongs to this effect's range |
+| `c.geo->step_along(px, c.dir)` | step number in travel order, 0 = first step reached |
+| `c.geo->along(px, c.dir)` | continuous position in steps along the travel direction |
+| `c.geo->pos_from(px, c.origin)` | distance in steps from the trigger end |
+| `n_steps(c)`, `n_px(c)` | steps in range, total pixels |
+
+#### Rules (enforced by the tests)
+
+- Write a level from 0 to 1 for **every** pixel; unmapped pixels get 0.
+- Start from `c.from` so transitions are seamless. `toward(c, px, on, p)`
+  blends from the captured level toward full (enter) or dark (exit).
+- Enter ends at exactly 1.0; exit and incidental end at exactly 0.0.
+- No state between calls: compute everything from `c.t` and `c.seed`. For
+  flicker, bucket time (`c.t / 40`) and use it as the random salt.
+- Count steps with `c.geo`; in a relay it covers one section only.
+- Implement `handoff()` if the effect has a moving front, so relays flow.
 
 ---
 
@@ -753,6 +923,79 @@ These come from having only two endpoint PIR sensors.
 
 ---
 
+## Future effects and ambient mode
+
+### Effects not built yet
+
+| Effect | Kind | Look |
+|---|---|---|
+| Typewriter | traversal | pixel by pixel, each with a tiny bright tick as it lands |
+| Bloom | traversal | each step lights from its center outward; made for the 9-pixel landing |
+| Bounce | traversal | a wave overshoots to the far end, bounces back, and settles to full |
+| Sparkle Fill | traversal | random pixels pop on until full, denser near you first |
+| Curtain | traversal | lights from both ends and meets in the middle (non-directional) |
+| Lead Glow | traversal | the steps just ahead of you brighten first, then the rest catch up |
+| Shrug | incidental | two quick dim blinks, then fade |
+| Ember | incidental | fades with slow random flicker, like dying coals |
+
+### Ambient mode (planned)
+
+Today, idle always means dark. Ambient mode would replace "dark" with a slow,
+low-level effect while nobody is on the stairs.
+
+**Controls**
+
+| Entity | Purpose |
+|---|---|
+| Ambient Mode (switch) | off = idle is dark (current behavior); on = idle runs the ambient effect |
+| Ambient Effect (select) | which ambient effect to run |
+| Ambient Level (number) | ceiling brightness for ambient, for example 5 to 15 % |
+
+Scheduling (only at night, only when dark) is best left to Home Assistant: an
+automation can toggle Ambient Mode by time, sun elevation, or lux.
+
+**Behavior**
+
+```mermaid
+stateDiagram-v2
+    [*] --> ambient: Ambient Mode on
+    [*] --> idle: Ambient Mode off
+    ambient --> enter: sensor triggered
+    idle --> enter: sensor triggered
+    enter --> hold
+    hold --> exit
+    exit --> ambient: Ambient Mode on
+    exit --> idle: Ambient Mode off
+```
+
+- A sensor trigger takes over instantly. Because every effect starts from the
+  levels already on the stairs, the enter effect grows out of the ambient glow
+  with no jump.
+- Exit and incidental effects end dark as today, then the ambient effect fades
+  back in over a couple of seconds.
+- Trip tracking, faults, gating and learning are unchanged; ambient only
+  replaces what idle looks like.
+- Ambient effects loop forever (no duration), stay at or below Ambient Level,
+  and use the section colors like everything else.
+
+**Ambient effect ideas**
+
+| Effect | Look |
+|---|---|
+| Glow | a steady, even night-light level |
+| Guide | only the first and last step of each flight glow, marking the edges |
+| Landing Beacon | only the landing glows |
+| Breathe | a very slow rise and fall (6 to 8 s per breath) |
+| Tide | a slow wave drifts from the bottom to the top and back |
+| Starfield | sparse pixels twinkle in and out at random |
+| Candle | gentle, irregular flicker like a candle |
+| Ember Bed | random pixels glow and fade slowly at different rates |
+
+Power note: ambient keeps LEDs lit all night. At a 10 % ceiling on this 58-pixel
+12 V strip the draw is small, but it is not zero.
+
+---
+
 ## Roadmap
 
 Product direction for this design:
@@ -764,12 +1007,31 @@ Product direction for this design:
 - ESP32-S3 controller with PSRAM, a custom PCB, and a 24 V LED rail with
   switched power for true zero standby draw.
 - RGBW and RGB+CCT strip support through a per-output color mapper.
+- Ambient mode (see above) and the remaining effects.
 - Optional Matter support (per-section lights, stair sensors as occupancy).
 - Speed-adaptive cascades that keep pace with the person.
 
 ---
 
 ## Changelog
+
+### v3.2.1
+- Fix ESP8266 build: renamed the `TWO_PI` constant to `kTwoPi` (the ESP8266
+  Arduino core defines `TWO_PI` as a macro). Core identifiers were checked
+  against the macros in the ESP8266 core and SDK headers; no other collisions.
+
+### v3.2
+- New traversal effects: Glitch, Stagger, Scatter. New incidental effects:
+  Peek, Sonar.
+- Relay: per-section traversal overrides with direction-aware hand-off. New
+  Landing Effect select.
+- Effect registry: effects are selected by name, so YAML option order no longer
+  matters. Custom effects live in `stair_effects_custom.cpp`; built-ins in
+  `stair_effects_builtin.cpp`; helpers in `stair_effect_util.h`.
+- Boot log lists every registered effect and the current selections.
+- Tests iterate the registry: every effect is checked on the full staircase and
+  on a single section (1,658 checks).
+- Soft Wipe timing adjusted so short relayed sections do not flash past.
 
 ### v3.1
 - Sensor fault detection: chatter (5 unconfirmed entries in 3 min) and stuck

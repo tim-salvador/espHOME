@@ -41,6 +41,9 @@ class Geometry {
 
   // Validates the layout and builds lookup tables. Returns false and sets error() on failure.
   bool finalize();
+  // Builds this geometry as sections [first, first+count) of `full`, steps renumbered from 0.
+  // Pixel indices stay global; pixels outside the subset are unmapped. Used for relays.
+  bool make_subset(const Geometry &full, uint8_t first, uint8_t count);
 
   bool valid() const { return this->valid_; }
   const char *error() const { return this->error_; }

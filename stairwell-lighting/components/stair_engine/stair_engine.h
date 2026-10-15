@@ -46,9 +46,15 @@ class StairEngine : public Component {
   // ---- look (r,g,b normalized 0..1 as reported by an RGB light's remote values)
   void set_section_color(uint8_t section, float r, float g, float b, float brightness, bool on);
   void set_master_brightness_pct(float pct) { this->master_ = clamp_(pct / 100.0f, 0.0f, 1.0f); }
-  void set_up_effect(size_t index);
-  void set_down_effect(size_t index);
-  void set_incidental_effect(size_t index);
+  // Effects are selected by registry name: pass the select's option text, e.g.
+  //   on_value: - lambda: id(stairs).set_up_effect(x.c_str(), x.size());
+  void set_up_effect(const char *name, size_t len) { this->select_(stair::Director::Slot::UP, name, len); }
+  void set_down_effect(const char *name, size_t len) { this->select_(stair::Director::Slot::DOWN, name, len); }
+  void set_incidental_effect(const char *name, size_t len) {
+    this->select_(stair::Director::Slot::INCIDENTAL, name, len);
+  }
+  // Relay override for one section; "Follow Action" clears it.
+  void set_section_effect(uint8_t section, const char *name, size_t len);
   void set_speed_pct(float pct) { this->dir_.settings().speed = clamp_(pct / 100.0f, 0.25f, 4.0f); }
 
   // ---- behavior
@@ -87,6 +93,7 @@ class StairEngine : public Component {
   static float clamp_(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
   static uint32_t to_ms_(float s) { return s <= 0.0f ? 0u : static_cast<uint32_t>(s * 1000.0f); }
   void simulate_(stair::SimAction a);
+  void select_(stair::Director::Slot slot, const char *name, size_t len);
 
   stair::Geometry geo_;
   stair::Director dir_;

@@ -1,0 +1,41 @@
+#pragma once
+// Framework-free core. No ESPHome includes in this file.
+//
+// The only place color enters the pipeline. Output is pre-gamma 8-bit RGB;
+// the LED driver applies gamma and global brightness afterward.
+
+#include <cstdint>
+#include "stair_geometry.h"
+
+namespace stair {
+
+struct SectionLook {
+  float r{1.0f}, g{1.0f}, b{1.0f};  // normalized color (max channel 1.0)
+  float brightness{1.0f};           // 0..1
+  bool enabled{true};
+};
+
+inline uint8_t to_u8(float v) {
+  if (v <= 0.0f) return 0;
+  if (v >= 1.0f) return 255;
+  return static_cast<uint8_t>(v * 255.0f + 0.5f);
+}
+
+// rgb_out: 3 bytes per pixel. looks: one per section.
+inline void compose(const Geometry &geo, const float *levels, const SectionLook *looks, float master,
+                    uint8_t *rgb_out) {
+  for (uint16_t px = 0; px < geo.num_pixels(); px++) {
+    const uint8_t s = geo.section_of(px);
+    uint8_t *o = rgb_out + 3 * px;
+    if (s == NO_SECTION || !looks[s].enabled) {
+      o[0] = o[1] = o[2] = 0;
+      continue;
+    }
+    const float k = levels[px] * looks[s].brightness * master;
+    o[0] = to_u8(looks[s].r * k);
+    o[1] = to_u8(looks[s].g * k);
+    o[2] = to_u8(looks[s].b * k);
+  }
+}
+
+}  // namespace stair

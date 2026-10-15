@@ -1,5 +1,5 @@
 # ==============================================================================
-# Stairwell Lighting v3.2 (stair_engine): dual-target ESP8266 / ESP32
+# Stairwell Lighting v3.2.2 (stair_engine): dual-target ESP8266 / ESP32
 #
 #   board:             esp8266 (NodeMCU v1.0 / ESP-12E, the installed unit) | esp32
 #   storage_installed: false until the storage-room PIR + white strip are wired

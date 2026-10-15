@@ -12,7 +12,7 @@ household actually takes on the stairs.
 All behavior lives in a small C++ engine that compiles and runs on a PC for
 testing (1,658 automated checks), then runs unchanged on an ESP8266 or ESP32.
 
-![version](https://img.shields.io/badge/version-3.2.1-blue) ![esphome](https://img.shields.io/badge/ESPHome-%E2%89%A52026.9.0-black) ![boards](https://img.shields.io/badge/boards-ESP8266%20%7C%20ESP32-green)
+![version](https://img.shields.io/badge/version-3.2.2-blue) ![esphome](https://img.shields.io/badge/ESPHome-%E2%89%A52026.9.0-black) ![boards](https://img.shields.io/badge/boards-ESP8266%20%7C%20ESP32-green)
 
 ---
 
@@ -356,7 +356,7 @@ flowchart LR
 ### Enabling it
 
 1. Wire the MOSFET, strip, and PIR as above.
-2. In `stairwell-2boards.yaml`, set `storage_installed: true`.
+2. In `stairwell-lighting.yaml`, set `storage_installed: true`.
 3. Flash. New entities appear: **Storage Light**, **Storage Motion**,
    **Storage Off Delay**, **Storage Brightness**, **Storage Motion Control**.
 
@@ -385,7 +385,7 @@ boot, so gate 2 never sees a floating input.
 
 ### Configure
 
-Edit the top of `stairwell-2boards.yaml`:
+Edit the top of `stairwell-lighting.yaml`:
 
 ```yaml
 substitutions:
@@ -406,9 +406,9 @@ openssl rand -base64 32    # paste as api_encryption_key
 ### Build
 
 ```bash
-esphome config  stairwell-2boards.yaml   # validate
-esphome compile stairwell-2boards.yaml   # build
-esphome run     stairwell-2boards.yaml   # flash and follow logs
+esphome config  stairwell-lighting.yaml   # validate
+esphome compile stairwell-lighting.yaml   # build
+esphome run     stairwell-lighting.yaml   # flash and follow logs
 ```
 
 ### First flash: use USB
@@ -741,7 +741,7 @@ Validation status of this release:
 
 ```
 .
-├── stairwell-2boards.yaml         device config (ESP8266 or ESP32)
+├── stairwell-lighting.yaml         device config (ESP8266 or ESP32)
 ├── secrets.example.yaml           template for secrets.yaml
 ├── README.md
 ├── .gitignore
@@ -1014,6 +1014,11 @@ Product direction for this design:
 ---
 
 ## Changelog
+
+### v3.2.2
+- Device config renamed `stairwell-2boards.yaml` to `stairwell-lighting.yaml`.
+  It is now the only YAML; earlier `stairwell.yaml` and `stairwell-2boards.yaml`
+  history remains in the git log and the `stairwell-v*` tags.
 
 ### v3.2.1
 - Fix ESP8266 build: renamed the `TWO_PI` constant to `kTwoPi` (the ESP8266

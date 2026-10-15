@@ -65,6 +65,7 @@ class StairEngine : public Component {
   void simulate_down() { this->simulate_(stair::SimAction::DOWN); }
   void simulate_incidental() { this->simulate_(stair::SimAction::INCIDENTAL); }
   void reset_learning();
+  void clear_sensor_faults() { this->dir_.clear_faults(millis()); }
 
   // ---- output: call from an addressable_lambda effect
   void render(light::AddressableLight &it);
@@ -74,6 +75,9 @@ class StairEngine : public Component {
   std::string last_event_text() const { return this->dir_.last_event(); }
   float learned_hold_s(bool up) const {
     return static_cast<float>(this->dir_.hold_ms_for(up ? stair::Dir::UP : stair::Dir::DOWN)) / 1000.0f;
+  }
+  bool sensor_fault(bool upper) const {
+    return this->dir_.sensor_fault(upper ? stair::End::UPPER : stair::End::LOWER);
   }
   float learned_samples(bool up) const {
     return static_cast<float>(this->dir_.learned_count(up ? stair::Dir::UP : stair::Dir::DOWN));

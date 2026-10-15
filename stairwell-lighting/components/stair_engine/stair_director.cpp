@@ -98,15 +98,21 @@ void Director::sensor(End e, bool active, uint32_t now) {
   if (!active) {
     this->had_fall_[i] = true;
     this->last_fall_[i] = now;
-    this->last_activity_ = now;
+    if (!this->fault_[i]) this->last_activity_ = now;
     return;
   }
 
-  this->last_activity_ = now;
+  this->last_rise_[i] = now;
+  this->active_since_[i] = now;
   if (this->booting_(now) && !this->sim_fast_) {
     this->note_("%s sensor ignored (boot settle)", end_name(e));
     return;
   }
+
+  // A faulted sensor may still wake the stairs from dark (a real person must never be left
+  // in the dark), but while lit it can neither extend the hold nor add phantom entries.
+  if (this->fault_[i] && this->lit_()) return;
+  this->last_activity_ = now;
 
   // A re-trigger shortly after this sensor cleared is the same presence (PIR chatter
   // or someone lingering), not a new arrival. Only meaningful while lit.
@@ -130,8 +136,9 @@ void Director::arrival_(End e, uint32_t now) {
   // Entries heading TOWARD this end are the ones this arrival could complete.
   const Dir toward = (e == End::UPPER) ? Dir::UP : Dir::DOWN;
   Queue &comp = this->q_[qi(toward)];
+  const bool comp_trusted = !this->fault_[static_cast<uint8_t>(far_end_of(e))];
   bool completion = false;
-  if (comp.n > 0 && (now - comp.front()) >= this->s_.min_traversal_ms) {
+  if (comp.n > 0 && comp_trusted && (now - comp.front()) >= this->s_.min_traversal_ms) {
     const uint32_t sample = now - comp.front();
     comp.pop();
     this->last_exit_dir_ = toward;
@@ -143,7 +150,15 @@ void Director::arrival_(End e, uint32_t now) {
     const Dir away = travel_dir_from(e);
     this->q_[qi(away)].push(now);
     this->note_("%s entry at %s (%u/%u pending)", dir_name(away), end_name(e), this->q_[0].n, this->q_[1].n);
+    // Chatter detection: many entries from one end, none of them ever completed.
+    const uint8_t ei = static_cast<uint8_t>(e);
+    this->recent_[ei].push(now);
+    if (!this->fault_[ei] && !this->sim_fast_ &&
+        this->recent_[ei].within(now, this->s_.fault_window_ms) >= this->s_.fault_entries) {
+      this->set_fault_(e, true, "repeated entries, none completed", now);
+    }
   }
+  if (completion) this->recent_[static_cast<uint8_t>(far_end_of(e))].clear();  // those entries were real
 
   switch (this->phase_) {
     case Phase::IDLE:
@@ -261,7 +276,8 @@ uint32_t Director::backstop_ms_() const {
   if (this->sim_fast_) return 3000;
   Dir d;
   End o;
-  if (!this->oldest_pending_(&d, &o)) d = this->last_exit_dir_;
+  if (!this->oldest_pending_(&d, &o)) return this->hold_ms_for(this->last_exit_dir_);
+  if (this->fault_[static_cast<uint8_t>(o)]) return this->s_.hold_min_ms;  // likely another false trigger
   return this->hold_ms_for(d);
 }
 
@@ -291,7 +307,17 @@ void Director::tick(uint32_t now) {
   }
 
   if (this->geo_ == nullptr || !this->geo_->valid()) return;
-  const bool any_active = this->active_[0] || this->active_[1];
+
+  for (uint8_t i = 0; i < 2; i++) {
+    const End e = static_cast<End>(i);
+    if (!this->fault_[i] && this->active_[i] && !this->booting_(now) &&
+        (now - this->active_since_[i]) >= this->s_.stuck_ms) {
+      this->set_fault_(e, true, "stuck active", now);
+    } else if (this->fault_[i] && !this->active_[i] && (now - this->last_rise_[i]) >= this->s_.fault_clear_ms) {
+      this->set_fault_(e, false, "quiet, auto-cleared", now);
+    }
+  }
+  const bool any_active = this->effective_active_();
   const uint32_t elapsed = now - this->phase_start_;
 
   auto fx_done = [&]() -> bool {
@@ -389,6 +415,22 @@ void Director::render(uint32_t now, float *levels) {
     }
   }
   std::copy(levels, levels + n, this->last_.begin());
+}
+
+// ------------------------------------------------------------------ faults
+
+void Director::set_fault_(End e, bool on, const char *why, uint32_t now) {
+  const uint8_t i = static_cast<uint8_t>(e);
+  if (this->fault_[i] == on) return;
+  this->fault_[i] = on;
+  this->recent_[i].clear();
+  if (!on) this->active_since_[i] = now;
+  this->note_("%s sensor fault %s: %s", end_name(e), on ? "SET" : "cleared", why);
+}
+
+void Director::clear_faults(uint32_t now) {
+  this->set_fault_(End::LOWER, false, "manual", now);
+  this->set_fault_(End::UPPER, false, "manual", now);
 }
 
 // ------------------------------------------------------------------ learning

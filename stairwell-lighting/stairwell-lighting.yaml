@@ -1,26 +1,183 @@
 # ==============================================================================
-# Stairwell Lighting v3.0 (stair_engine)
+# Stairwell Lighting v3.1 (stair_engine): dual-target ESP8266 / ESP32
 #
-# Target:   ESP32 WROOM-32 (esp32dev), ESP-IDF toolchain, ESPHome >= 2026.9.0
-# LEDs:     WS2811 12 V, BRG order, 58 pixels on one data line
-# Sensors:  PIR at the bottom (lower) and top (upper) of the stairs
+#   board:             esp8266 (NodeMCU v1.0 / ESP-12E, the installed unit) | esp32
+#   storage_installed: false until the storage-room PIR + white strip are wired
 #
+# Requires ESPHome >= 2026.9.0 (Jinja substitutions with dict values).
+# See README.md for wiring, entities, and rationale.
+#
+# Stair LEDs: WS2811 12 V, BRG order, 58 pixels, one data line (via 74AHCT125)
 # Layout (pixel 0 = bottom of the stairs), bottom to top:
 #   Lower Flight   px  0-15   2 px/step   8 steps
 #   Landing        px 16-51   9 px/step   4 step-equivalents
 #   Upper Flight   px 52-57   2 px/step   3 steps
-#
-# All lighting logic lives in components/stair_engine (C++). This file only
-# wires hardware and Home Assistant entities to it.
 # ==============================================================================
 
 substitutions:
+  board: esp8266           # esp8266 | esp32
+  storage_installed: false # true once the storage PIR + MOSFET strip are wired
   name: stairwell
   friendly_name: Stairwell
-  led_pin: GPIO18          # via 74AHCT125 level shifter recommended
-  upper_pir_pin: GPIO32    # NOT GPIO12 (strapping pin: 1.8 V flash select, boot loop)
-  lower_pir_pin: GPIO33
   lux_entity: sensor.hue_motion_sensor_1_illuminance
+
+  boards:
+    esp8266:               # HiLetgo NodeMCU v1.0 (ESP8266MOD = ESP-12E), 4 MB flash
+      upper_pir_pin: GPIO12      # D6
+      lower_pir_pin: GPIO13      # D7 (moved off D5 while chasing false triggers)
+      pir_pulldown: false        # ESP8266: internal pulldown only exists on GPIO16
+      storage_pir_pin: GPIO14    # D5 (future)
+      storage_led_pin: GPIO5     # D1 -> 74AHCT125 gate 2 (pin 5 in, pin 6 out) -> MOSFET gate
+      storage_pwm: esp8266_pwm
+      package:
+        esp8266:
+          board: nodemcuv2
+        light:
+          - platform: neopixelbus
+            id: stair_strip
+            name: Strip Driver
+            internal: true
+            pin: GPIO4           # D2 -> 74AHCT125 gate 1 (pin 2 in, pin 3 out)
+            # Bit-bang blocks interrupts ~1.8 ms per frame. If Wi-Fi/API drops
+            # appear, move data to GPIO3 (RX) and add:  method: esp8266_dma
+            num_leds: 58
+            variant: WS2811
+            type: BRG
+            restore_mode: ALWAYS_ON
+            default_transition_length: 0s
+            gamma_correct: 2.8
+            effects:
+              - addressable_lambda:
+                  name: Engine
+                  update_interval: 30ms   # no FPU: lighter frame rate
+                  lambda: id(stairs).render(it);
+
+    esp32:                 # ESP32 WROOM-32 (esp32dev)
+      upper_pir_pin: GPIO32      # NOT GPIO12 on ESP32 (strapping pin: 1.8 V flash, boot loop)
+      lower_pir_pin: GPIO33
+      pir_pulldown: true
+      storage_pir_pin: GPIO25
+      storage_led_pin: GPIO19
+      storage_pwm: ledc
+      package:
+        esp32:
+          board: esp32dev
+          framework:
+            type: esp-idf
+        light:
+          - platform: esp32_rmt_led_strip
+            id: stair_strip
+            name: Strip Driver
+            internal: true
+            pin: GPIO18          # via 74AHCT125
+            num_leds: 58
+            chipset: WS2811
+            channel_colors: BRG
+            restore_mode: ALWAYS_ON
+            default_transition_length: 0s
+            gamma_correct: 2.8
+            effects:
+              - addressable_lambda:
+                  name: Engine
+                  update_interval: 20ms
+                  lambda: id(stairs).render(it);
+
+  hw: ${ boards[board] }
+
+  # Always present: drives the storage LED pin LOW from boot, so the level
+  # shifter's gate 2 never sees a floating input (and the MOSFET stays off)
+  # whether or not the storage strip is installed yet.
+  storage_output_pkg:
+    output:
+      - platform: ${ hw.storage_pwm }
+        id: storage_out
+        pin: ${ hw.storage_led_pin }
+        frequency: 1000Hz
+
+  # Storage room: PIR -> fade on, PIR clear + delay -> fade off.
+  storage_pkg:
+    light:
+      - platform: monochromatic
+        id: storage_light
+        name: Storage Light
+        icon: mdi:light-recessed
+        output: storage_out
+        restore_mode: ALWAYS_OFF
+        default_transition_length: 1s
+        gamma_correct: 2.8
+    binary_sensor:
+      - platform: gpio
+        id: pir_storage
+        name: Storage Motion
+        device_class: motion
+        pin:
+          number: ${ hw.storage_pir_pin }
+          mode:
+            input: true
+            pulldown: ${ hw.pir_pulldown }
+        filters:
+          - delayed_on: 30ms
+        on_press:
+          - if:
+              condition:
+                switch.is_on: storage_auto
+              then:
+                - script.stop: storage_off_timer
+                - light.turn_on:
+                    id: storage_light
+                    brightness: !lambda 'return id(storage_brightness).state / 100.0f;'
+        on_release:
+          - if:
+              condition:
+                switch.is_on: storage_auto
+              then:
+                - script.execute: storage_off_timer
+    script:
+      - id: storage_off_timer
+        mode: restart
+        then:
+          - delay: !lambda 'return (uint32_t) (id(storage_off_delay).state * 1000.0f);'
+          - light.turn_off:
+              id: storage_light
+              transition_length: 2s
+    number:
+      - platform: template
+        id: storage_off_delay
+        name: Storage Off Delay
+        icon: mdi:timer-outline
+        unit_of_measurement: s
+        min_value: 5
+        max_value: 900
+        step: 5
+        initial_value: 60
+        optimistic: true
+        restore_value: true
+        entity_category: config
+      - platform: template
+        id: storage_brightness
+        name: Storage Brightness
+        icon: mdi:brightness-6
+        unit_of_measurement: "%"
+        min_value: 5
+        max_value: 100
+        step: 5
+        initial_value: 100
+        optimistic: true
+        restore_value: true
+        entity_category: config
+    switch:
+      - platform: template
+        id: storage_auto
+        name: Storage Motion Control
+        icon: mdi:motion-sensor
+        optimistic: true
+        restore_mode: RESTORE_DEFAULT_ON
+        entity_category: config
+
+packages:
+  board_hw: ${ hw.package }
+  storage_output: ${ storage_output_pkg }
+  storage: ${ storage_pkg if storage_installed else {} }
 
 esphome:
   name: ${name}
@@ -35,11 +192,6 @@ esphome:
           id: stair_strip
           brightness: 100%
           effect: Engine
-
-esp32:
-  board: esp32dev
-  framework:
-    type: esp-idf
 
 external_components:
   - source:
@@ -63,6 +215,7 @@ ota:
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
+  # output_power: 13dB     # diagnostic: lower TX power if PIRs false-trigger on Wi-Fi bursts
   ap:
     ssid: "${friendly_name} Fallback"
     password: !secret fallback_ap_password
@@ -97,23 +250,8 @@ stair_engine:
 # LEDs
 # ------------------------------------------------------------------------------
 light:
-  - platform: esp32_rmt_led_strip
-    id: stair_strip
-    name: Strip Driver
-    internal: true
-    pin: ${led_pin}
-    num_leds: 58
-    chipset: WS2811
-    channel_colors: BRG
-    restore_mode: ALWAYS_ON
-    default_transition_length: 0s
-    gamma_correct: 2.8
-    effects:
-      - addressable_lambda:
-          name: Engine
-          update_interval: 20ms
-          lambda: id(stairs).render(it);
-
+  # The strip driver light comes from the board package.
+  #
   # Per-section color pickers. Virtual: they drive no hardware. Color = hue,
   # brightness = section brightness, off = section disabled. Changing one
   # previews that section on the stairs for 5 s when the stairs are idle.
@@ -201,10 +339,10 @@ binary_sensor:
     name: Lower Motion
     device_class: motion
     pin:
-      number: ${lower_pir_pin}
+      number: ${ hw.lower_pir_pin }
       mode:
         input: true
-        pulldown: true
+        pulldown: ${ hw.pir_pulldown }
     filters:
       - delayed_on: 30ms   # noise guard for long sensor runs; chatter is handled in the engine
     on_state:
@@ -215,14 +353,29 @@ binary_sensor:
     name: Upper Motion
     device_class: motion
     pin:
-      number: ${upper_pir_pin}
+      number: ${ hw.upper_pir_pin }
       mode:
         input: true
-        pulldown: true
+        pulldown: ${ hw.pir_pulldown }
     filters:
       - delayed_on: 30ms
     on_state:
       - lambda: id(stairs).set_upper_sensor(x);
+
+  # A sensor is flagged when it keeps producing entries that never complete
+  # (false triggers) or stays active > 5 min (stuck). While flagged it can still
+  # wake dark stairs but cannot hold them on. Auto-clears after 10 quiet minutes.
+  - platform: template
+    name: Lower Sensor Fault
+    device_class: problem
+    entity_category: diagnostic
+    lambda: return id(stairs).sensor_fault(false);
+
+  - platform: template
+    name: Upper Sensor Fault
+    device_class: problem
+    entity_category: diagnostic
+    lambda: return id(stairs).sensor_fault(true);
 
 sensor:
   - platform: homeassistant
@@ -462,6 +615,13 @@ button:
     icon: mdi:shimmer
     on_press:
       - lambda: id(stairs).simulate_incidental();
+
+  - platform: template
+    name: Clear Sensor Faults
+    icon: mdi:alert-remove-outline
+    entity_category: config
+    on_press:
+      - lambda: id(stairs).clear_sensor_faults();
 
   - platform: template
     name: Reset Learned Timing

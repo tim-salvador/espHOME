@@ -40,6 +40,11 @@ struct Settings {
   uint32_t rearm_ms{1500};          // re-trigger closer than this to the last clear = same presence
   uint32_t min_traversal_ms{800};   // a far-end trigger sooner than this is not a completion
   uint32_t boot_ignore_ms{3000};    // ignore arrivals right after boot (PIR settle)
+  // Sensor fault detection (false-triggering or stuck sensors must not hold the lights on)
+  uint8_t fault_entries{5};         // this many new entries at one end...
+  uint32_t fault_window_ms{180000}; // ...within this window, none completed = fault
+  uint32_t fault_clear_ms{600000};  // auto-clear after this long with no rises from that end
+  uint32_t stuck_ms{300000};        // continuously active this long = stuck fault
   // Look
   float speed{1.0f};
   Style style_up{Style::CASCADE};
@@ -91,6 +96,8 @@ class Director {
   uint8_t pending(Dir d) const { return this->q_[qi(d)].n; }
   uint32_t hold_ms_for(Dir d) const;
   uint8_t learned_count(Dir d) const { return this->learn_.count[qi(d)]; }
+  bool sensor_fault(End e) const { return this->fault_[static_cast<uint8_t>(e)]; }
+  void clear_faults(uint32_t now);
 
   // ---- learning persistence
   void load_learning(const LearnBlob &b);
@@ -107,6 +114,25 @@ class Director {
     void push(uint32_t v);
     uint32_t front() const { return this->t[0]; }
     void pop();
+    void clear() { this->n = 0; }
+  };
+  struct Recent {
+    static constexpr uint8_t CAP = 8;
+    uint32_t t[CAP];
+    uint8_t n{0};
+    void push(uint32_t v) {
+      if (this->n == CAP) {
+        for (uint8_t i = 1; i < CAP; i++) this->t[i - 1] = this->t[i];
+        this->n--;
+      }
+      this->t[this->n++] = v;
+    }
+    uint8_t within(uint32_t now, uint32_t window) const {
+      uint8_t c = 0;
+      for (uint8_t i = 0; i < this->n; i++)
+        if (now - this->t[i] < window) c++;
+      return c;
+    }
     void clear() { this->n = 0; }
   };
   struct SimEvent {
@@ -126,6 +152,10 @@ class Director {
   void record_sample_(Dir d, uint32_t sample_ms);
   uint32_t backstop_ms_() const;
   bool oldest_pending_(Dir *d, End *origin) const;
+  void set_fault_(End e, bool on, const char *why, uint32_t now);
+  bool effective_active_() const {
+    return (this->active_[0] && !this->fault_[0]) || (this->active_[1] && !this->fault_[1]);
+  }
   void note_(const char *fmt, ...);
 
   const Geometry *geo_{nullptr};
@@ -144,6 +174,10 @@ class Director {
   bool had_fall_[2]{false, false};
   uint32_t last_fall_[2]{0, 0};
   uint32_t last_activity_{0};
+  uint32_t last_rise_[2]{0, 0};
+  uint32_t active_since_[2]{0, 0};
+  bool fault_[2]{false, false};
+  Recent recent_[2];
   Dir last_exit_dir_{Dir::UP};
   Queue q_[2];  // pending traversals: [0]=UP (entered at lower), [1]=DOWN (entered at upper)
   float lux_{NAN};

@@ -1,0 +1,634 @@
+# ==============================================================================
+# Stairwell Lighting v3.1 (stair_engine): dual-target ESP8266 / ESP32
+#
+#   board:             esp8266 (NodeMCU v1.0 / ESP-12E, the installed unit) | esp32
+#   storage_installed: false until the storage-room PIR + white strip are wired
+#
+# Requires ESPHome >= 2026.9.0 (Jinja substitutions with dict values).
+# See README.md for wiring, entities, and rationale.
+#
+# Stair LEDs: WS2811 12 V, BRG order, 58 pixels, one data line (via 74AHCT125)
+# Layout (pixel 0 = bottom of the stairs), bottom to top:
+#   Lower Flight   px  0-15   2 px/step   8 steps
+#   Landing        px 16-51   9 px/step   4 step-equivalents
+#   Upper Flight   px 52-57   2 px/step   3 steps
+# ==============================================================================
+
+substitutions:
+  board: esp8266           # esp8266 | esp32
+  storage_installed: false # true once the storage PIR + MOSFET strip are wired
+  name: stairwell
+  friendly_name: Stairwell
+  lux_entity: sensor.hue_motion_sensor_1_illuminance
+
+  boards:
+    esp8266:               # HiLetgo NodeMCU v1.0 (ESP8266MOD = ESP-12E), 4 MB flash
+      upper_pir_pin: GPIO12      # D6
+      lower_pir_pin: GPIO13      # D7 (moved off D5 while chasing false triggers)
+      pir_pulldown: false        # ESP8266: internal pulldown only exists on GPIO16
+      storage_pir_pin: GPIO14    # D5 (future)
+      storage_led_pin: GPIO5     # D1 -> 74AHCT125 gate 2 (pin 5 in, pin 6 out) -> MOSFET gate
+      storage_pwm: esp8266_pwm
+      package:
+        esp8266:
+          board: nodemcuv2
+        light:
+          - platform: neopixelbus
+            id: stair_strip
+            name: Strip Driver
+            internal: true
+            pin: GPIO4           # D2 -> 74AHCT125 gate 1 (pin 2 in, pin 3 out)
+            # Bit-bang blocks interrupts ~1.8 ms per frame. If Wi-Fi/API drops
+            # appear, move data to GPIO3 (RX) and add:  method: esp8266_dma
+            num_leds: 58
+            variant: WS2811
+            type: BRG
+            restore_mode: ALWAYS_ON
+            default_transition_length: 0s
+            gamma_correct: 2.8
+            effects:
+              - addressable_lambda:
+                  name: Engine
+                  update_interval: 30ms   # no FPU: lighter frame rate
+                  lambda: id(stairs).render(it);
+
+    esp32:                 # ESP32 WROOM-32 (esp32dev)
+      upper_pir_pin: GPIO32      # NOT GPIO12 on ESP32 (strapping pin: 1.8 V flash, boot loop)
+      lower_pir_pin: GPIO33
+      pir_pulldown: true
+      storage_pir_pin: GPIO25
+      storage_led_pin: GPIO19
+      storage_pwm: ledc
+      package:
+        esp32:
+          board: esp32dev
+          framework:
+            type: esp-idf
+        light:
+          - platform: esp32_rmt_led_strip
+            id: stair_strip
+            name: Strip Driver
+            internal: true
+            pin: GPIO18          # via 74AHCT125
+            num_leds: 58
+            chipset: WS2811
+            channel_colors: BRG
+            restore_mode: ALWAYS_ON
+            default_transition_length: 0s
+            gamma_correct: 2.8
+            effects:
+              - addressable_lambda:
+                  name: Engine
+                  update_interval: 20ms
+                  lambda: id(stairs).render(it);
+
+  hw: ${ boards[board] }
+
+  # Always present: drives the storage LED pin LOW from boot, so the level
+  # shifter's gate 2 never sees a floating input (and the MOSFET stays off)
+  # whether or not the storage strip is installed yet.
+  storage_output_pkg:
+    output:
+      - platform: ${ hw.storage_pwm }
+        id: storage_out
+        pin: ${ hw.storage_led_pin }
+        frequency: 1000Hz
+
+  # Storage room: PIR -> fade on, PIR clear + delay -> fade off.
+  storage_pkg:
+    light:
+      - platform: monochromatic
+        id: storage_light
+        name: Storage Light
+        icon: mdi:light-recessed
+        output: storage_out
+        restore_mode: ALWAYS_OFF
+        default_transition_length: 1s
+        gamma_correct: 2.8
+    binary_sensor:
+      - platform: gpio
+        id: pir_storage
+        name: Storage Motion
+        device_class: motion
+        pin:
+          number: ${ hw.storage_pir_pin }
+          mode:
+            input: true
+            pulldown: ${ hw.pir_pulldown }
+        filters:
+          - delayed_on: 30ms
+        on_press:
+          - if:
+              condition:
+                switch.is_on: storage_auto
+              then:
+                - script.stop: storage_off_timer
+                - light.turn_on:
+                    id: storage_light
+                    brightness: !lambda 'return id(storage_brightness).state / 100.0f;'
+        on_release:
+          - if:
+              condition:
+                switch.is_on: storage_auto
+              then:
+                - script.execute: storage_off_timer
+    script:
+      - id: storage_off_timer
+        mode: restart
+        then:
+          - delay: !lambda 'return (uint32_t) (id(storage_off_delay).state * 1000.0f);'
+          - light.turn_off:
+              id: storage_light
+              transition_length: 2s
+    number:
+      - platform: template
+        id: storage_off_delay
+        name: Storage Off Delay
+        icon: mdi:timer-outline
+        unit_of_measurement: s
+        min_value: 5
+        max_value: 900
+        step: 5
+        initial_value: 60
+        optimistic: true
+        restore_value: true
+        entity_category: config
+      - platform: template
+        id: storage_brightness
+        name: Storage Brightness
+        icon: mdi:brightness-6
+        unit_of_measurement: "%"
+        min_value: 5
+        max_value: 100
+        step: 5
+        initial_value: 100
+        optimistic: true
+        restore_value: true
+        entity_category: config
+    switch:
+      - platform: template
+        id: storage_auto
+        name: Storage Motion Control
+        icon: mdi:motion-sensor
+        optimistic: true
+        restore_mode: RESTORE_DEFAULT_ON
+        entity_category: config
+
+packages:
+  board_hw: ${ hw.package }
+  storage_output: ${ storage_output_pkg }
+  storage: ${ storage_pkg if storage_installed else {} }
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  min_version: 2026.9.0
+  on_boot:
+    priority: -100
+    then:
+      # The strip is an internal render target. It stays on with the Engine
+      # effect permanently; "off" is simply the engine rendering black.
+      - light.turn_on:
+          id: stair_strip
+          brightness: 100%
+          effect: Engine
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [stair_engine]
+
+logger:
+  level: DEBUG
+  logs:
+    light: INFO            # suppress per-change light chatter from the color pickers
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    encryption: {}         # inherits the api key; uploads must be encrypted
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # output_power: 13dB     # diagnostic: lower TX power if PIRs false-trigger on Wi-Fi bursts
+  ap:
+    ssid: "${friendly_name} Fallback"
+    password: !secret fallback_ap_password
+
+captive_portal:
+
+web_server:
+  version: 3
+  ota: false             # closes the plaintext /update path; uploads go through encrypted OTA only
+
+# ------------------------------------------------------------------------------
+# Engine
+# ------------------------------------------------------------------------------
+stair_engine:
+  id: stairs
+  num_pixels: 58
+  sections:              # bottom to top; index order matches the color lights below
+    - name: Lower Flight
+      first_pixel: 0
+      pixels: 16
+      pixels_per_step: 2
+    - name: Landing
+      first_pixel: 16
+      pixels: 36
+      pixels_per_step: 9
+    - name: Upper Flight
+      first_pixel: 52
+      pixels: 6
+      pixels_per_step: 2
+
+# ------------------------------------------------------------------------------
+# LEDs
+# ------------------------------------------------------------------------------
+light:
+  # The strip driver light comes from the board package.
+  #
+  # Per-section color pickers. Virtual: they drive no hardware. Color = hue,
+  # brightness = section brightness, off = section disabled. Changing one
+  # previews that section on the stairs for 5 s when the stairs are idle.
+  - platform: rgb
+    id: color_lower
+    name: Lower Flight Color
+    icon: mdi:palette
+    red: v_lower_r
+    green: v_lower_g
+    blue: v_lower_b
+    restore_mode: RESTORE_DEFAULT_ON
+    default_transition_length: 0s
+    gamma_correct: 1.0
+    initial_state:
+      state: true
+      brightness: 100%
+      red: 100%
+      green: 92.7%
+      blue: 76.4%
+    on_state:
+      - lambda: |-
+          const auto &v = id(color_lower).remote_values;
+          id(stairs).set_section_color(0, v.get_red(), v.get_green(), v.get_blue(), v.get_brightness(), v.is_on());
+
+  - platform: rgb
+    id: color_landing
+    name: Landing Color
+    icon: mdi:palette
+    red: v_landing_r
+    green: v_landing_g
+    blue: v_landing_b
+    restore_mode: RESTORE_DEFAULT_ON
+    default_transition_length: 0s
+    gamma_correct: 1.0
+    initial_state:
+      state: true
+      brightness: 100%
+      red: 0%
+      green: 27.1%
+      blue: 100%
+    on_state:
+      - lambda: |-
+          const auto &v = id(color_landing).remote_values;
+          id(stairs).set_section_color(1, v.get_red(), v.get_green(), v.get_blue(), v.get_brightness(), v.is_on());
+
+  - platform: rgb
+    id: color_upper
+    name: Upper Flight Color
+    icon: mdi:palette
+    red: v_upper_r
+    green: v_upper_g
+    blue: v_upper_b
+    restore_mode: RESTORE_DEFAULT_ON
+    default_transition_length: 0s
+    gamma_correct: 1.0
+    initial_state:
+      state: true
+      brightness: 100%
+      red: 100%
+      green: 92.7%
+      blue: 76.4%
+    on_state:
+      - lambda: |-
+          const auto &v = id(color_upper).remote_values;
+          id(stairs).set_section_color(2, v.get_red(), v.get_green(), v.get_blue(), v.get_brightness(), v.is_on());
+
+# Sinks for the virtual color pickers (the engine reads the light state directly).
+output:
+  - { platform: template, id: v_lower_r,   type: float, write_action: [lambda: (void) state;] }
+  - { platform: template, id: v_lower_g,   type: float, write_action: [lambda: (void) state;] }
+  - { platform: template, id: v_lower_b,   type: float, write_action: [lambda: (void) state;] }
+  - { platform: template, id: v_landing_r, type: float, write_action: [lambda: (void) state;] }
+  - { platform: template, id: v_landing_g, type: float, write_action: [lambda: (void) state;] }
+  - { platform: template, id: v_landing_b, type: float, write_action: [lambda: (void) state;] }
+  - { platform: template, id: v_upper_r,   type: float, write_action: [lambda: (void) state;] }
+  - { platform: template, id: v_upper_g,   type: float, write_action: [lambda: (void) state;] }
+  - { platform: template, id: v_upper_b,   type: float, write_action: [lambda: (void) state;] }
+
+# ------------------------------------------------------------------------------
+# Sensors
+# ------------------------------------------------------------------------------
+binary_sensor:
+  - platform: gpio
+    id: pir_lower
+    name: Lower Motion
+    device_class: motion
+    pin:
+      number: ${ hw.lower_pir_pin }
+      mode:
+        input: true
+        pulldown: ${ hw.pir_pulldown }
+    filters:
+      - delayed_on: 30ms   # noise guard for long sensor runs; chatter is handled in the engine
+    on_state:
+      - lambda: id(stairs).set_lower_sensor(x);
+
+  - platform: gpio
+    id: pir_upper
+    name: Upper Motion
+    device_class: motion
+    pin:
+      number: ${ hw.upper_pir_pin }
+      mode:
+        input: true
+        pulldown: ${ hw.pir_pulldown }
+    filters:
+      - delayed_on: 30ms
+    on_state:
+      - lambda: id(stairs).set_upper_sensor(x);
+
+  # A sensor is flagged when it keeps producing entries that never complete
+  # (false triggers) or stays active > 5 min (stuck). While flagged it can still
+  # wake dark stairs but cannot hold them on. Auto-clears after 10 quiet minutes.
+  - platform: template
+    name: Lower Sensor Fault
+    device_class: problem
+    entity_category: diagnostic
+    lambda: return id(stairs).sensor_fault(false);
+
+  - platform: template
+    name: Upper Sensor Fault
+    device_class: problem
+    entity_category: diagnostic
+    lambda: return id(stairs).sensor_fault(true);
+
+sensor:
+  - platform: homeassistant
+    id: ambient_lux
+    entity_id: ${lux_entity}
+    internal: true
+    on_value:
+      - lambda: id(stairs).set_ambient_lux(x);
+
+  - platform: template
+    name: Learned Hold Up
+    unit_of_measurement: s
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: return id(stairs).learned_hold_s(true);
+
+  - platform: template
+    name: Learned Hold Down
+    unit_of_measurement: s
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: return id(stairs).learned_hold_s(false);
+
+  - platform: template
+    name: Learned Samples Up
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: return id(stairs).learned_samples(true);
+
+  - platform: template
+    name: Learned Samples Down
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: return id(stairs).learned_samples(false);
+
+  - platform: wifi_signal
+    name: WiFi Signal
+    update_interval: 60s
+
+  - platform: uptime
+    name: Uptime
+
+text_sensor:
+  - platform: template
+    name: State
+    icon: mdi:stairs
+    update_interval: 500ms
+    lambda: return id(stairs).state_text();
+
+  - platform: template
+    name: Last Event
+    icon: mdi:text-box-outline
+    entity_category: diagnostic
+    update_interval: 1s
+    lambda: return id(stairs).last_event_text();
+
+# ------------------------------------------------------------------------------
+# Effects per action
+# Option ORDER is the contract with the engine (Style / IncidentalStyle enums).
+# ------------------------------------------------------------------------------
+select:
+  - platform: template
+    name: Up Effect
+    icon: mdi:stairs-up
+    options: [Cascade, Soft Wipe, Comet, Fade]
+    initial_option: Cascade
+    optimistic: true
+    restore_value: true
+    on_value:
+      - lambda: id(stairs).set_up_effect(i);
+
+  - platform: template
+    name: Down Effect
+    icon: mdi:stairs-down
+    options: [Cascade, Soft Wipe, Comet, Fade]
+    initial_option: Cascade
+    optimistic: true
+    restore_value: true
+    on_value:
+      - lambda: id(stairs).set_down_effect(i);
+
+  - platform: template
+    name: Incidental Effect
+    icon: mdi:shimmer
+    options: [Retreat, Firefly, Ripple, Breath]
+    initial_option: Retreat
+    optimistic: true
+    restore_value: true
+    on_value:
+      - lambda: id(stairs).set_incidental_effect(i);
+
+# ------------------------------------------------------------------------------
+# Tunables
+# ------------------------------------------------------------------------------
+number:
+  - platform: template
+    name: Effect Speed
+    icon: mdi:speedometer
+    unit_of_measurement: "%"
+    min_value: 25
+    max_value: 200
+    step: 5
+    initial_value: 100
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    on_value:
+      - lambda: id(stairs).set_speed_pct(x);
+
+  - platform: template
+    name: Master Brightness
+    icon: mdi:brightness-6
+    unit_of_measurement: "%"
+    min_value: 5
+    max_value: 100
+    step: 5
+    initial_value: 100
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    on_value:
+      - lambda: id(stairs).set_master_brightness_pct(x);
+
+  - platform: template
+    name: Hold Minimum
+    icon: mdi:timer-sand
+    unit_of_measurement: s
+    min_value: 5
+    max_value: 120
+    step: 5
+    initial_value: 20
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    on_value:
+      - lambda: id(stairs).set_hold_min_s(x);
+
+  - platform: template
+    name: Hold Maximum
+    icon: mdi:timer-sand-full
+    unit_of_measurement: s
+    min_value: 10
+    max_value: 300
+    step: 5
+    initial_value: 60
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    on_value:
+      - lambda: id(stairs).set_hold_max_s(x);
+
+  - platform: template
+    name: Grace Period
+    icon: mdi:timer-outline
+    unit_of_measurement: s
+    min_value: 2
+    max_value: 30
+    step: 1
+    initial_value: 8
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    on_value:
+      - lambda: id(stairs).set_grace_s(x);
+
+  - platform: template
+    name: Grace Level
+    icon: mdi:brightness-4
+    unit_of_measurement: "%"
+    min_value: 5
+    max_value: 80
+    step: 5
+    initial_value: 35
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    on_value:
+      - lambda: id(stairs).set_grace_level_pct(x);
+
+  - platform: template
+    name: Exit Delay
+    icon: mdi:timer-cog-outline
+    unit_of_measurement: s
+    min_value: 0
+    max_value: 10
+    step: 0.5
+    initial_value: 1.5
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    on_value:
+      - lambda: id(stairs).set_exit_delay_s(x);
+
+  - platform: template
+    name: Ambient Threshold
+    icon: mdi:white-balance-sunny
+    unit_of_measurement: lx
+    min_value: 0
+    max_value: 500
+    step: 5
+    initial_value: 75
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    on_value:
+      - lambda: id(stairs).set_lux_threshold(x);
+
+switch:
+  - platform: template
+    name: Ambient Gating
+    icon: mdi:theme-light-dark
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    entity_category: config
+    on_state:
+      - lambda: id(stairs).set_gating(x);
+
+button:
+  - platform: template
+    name: Simulate Up
+    icon: mdi:stairs-up
+    on_press:
+      - lambda: id(stairs).simulate_up();
+
+  - platform: template
+    name: Simulate Down
+    icon: mdi:stairs-down
+    on_press:
+      - lambda: id(stairs).simulate_down();
+
+  - platform: template
+    name: Simulate Incidental
+    icon: mdi:shimmer
+    on_press:
+      - lambda: id(stairs).simulate_incidental();
+
+  - platform: template
+    name: Clear Sensor Faults
+    icon: mdi:alert-remove-outline
+    entity_category: config
+    on_press:
+      - lambda: id(stairs).clear_sensor_faults();
+
+  - platform: template
+    name: Reset Learned Timing
+    icon: mdi:restore
+    entity_category: config
+    on_press:
+      - lambda: id(stairs).reset_learning();
+
+  - platform: restart
+    name: Restart

@@ -330,6 +330,72 @@ static void t_ambiguous_crossing() {
   CHECK(r.lv[0] > 0.6f, "bottom relit within 400 ms (%.2f), phase %s", r.lv[0], r.d.phase_text());
 }
 
+static void t_chatter_fault_from_log() {
+  printf("false-triggering lower PIR (pattern from the field log)\n");
+  Rig r;
+  // Intervals between lower rises observed 05:55:09 -> 05:58:12, 2 s AM312 pulses, nobody on the stairs.
+  const uint32_t gaps[] = {0, 6000, 5000, 12000, 47000, 20000, 10000, 6000, 22000, 12000, 43000};
+  bool reached_idle_while_chattering = false;
+  for (uint32_t g : gaps) {
+    for (uint32_t k = 0; k < g / 10; k++) {
+      r.step();
+      if (r.d.sensor_fault(End::LOWER) && r.d.phase() == Phase::IDLE) reached_idle_while_chattering = true;
+    }
+    r.sensor(End::LOWER, true);
+    r.advance(2000);
+    r.sensor(End::LOWER, false);
+  }
+  CHECK(r.d.sensor_fault(End::LOWER), "lower flagged as faulted");
+  CHECK(!r.d.sensor_fault(End::UPPER), "upper not flagged");
+  CHECK(r.d.pending(Dir::UP) <= 2, "faulted rises stop piling up entries (%u)", r.d.pending(Dir::UP));
+  CHECK(reached_idle_while_chattering, "lights actually turned off despite chatter");
+  uint32_t ms = r.run_until_phase(Phase::IDLE, 60000);
+  CHECK(ms != UINT32_MAX, "settles to idle after the last false trigger");
+  r.advance(600000 + 1000);
+  CHECK(!r.d.sensor_fault(End::LOWER), "auto-clears after 10 quiet minutes");
+}
+
+static void t_stuck_sensor() {
+  printf("stuck-high sensor cannot hold the lights forever\n");
+  Rig r;
+  r.sensor(End::LOWER, true);  // never releases
+  r.advance(r.d.settings().stuck_ms + 100);
+  CHECK(r.d.sensor_fault(End::LOWER), "stuck fault set");
+  CHECK(r.run_until_phase(Phase::IDLE, 120000) != UINT32_MAX, "goes dark despite stuck sensor");
+  r.sensor(End::LOWER, false);
+  r.advance(r.d.settings().fault_clear_ms + 1000);
+  CHECK(!r.d.sensor_fault(End::LOWER), "clears once released and quiet");
+}
+
+static void t_faulted_sensor_still_wakes() {
+  printf("faulted sensor still wakes dark stairs; good sensor still holds them\n");
+  Rig r;
+  for (int i = 0; i < 5; i++) {  // drive lower into fault
+    r.sensor(End::LOWER, true);
+    r.advance(2000);
+    r.sensor(End::LOWER, false);
+    r.advance(8000);
+  }
+  CHECK(r.d.sensor_fault(End::LOWER), "precondition: lower faulted");
+  r.run_until_phase(Phase::IDLE, 120000);
+  r.advance(3000);
+  uint32_t b = r.rel();
+  r.sensor(End::LOWER, true);  // a real person
+  CHECK(r.d.phase() == Phase::ENTER, "faulted sensor wakes from idle, got %s", r.d.phase_text());
+  r.until(b + 2000);
+  r.sensor(End::LOWER, false);
+  r.until(b + 7000);
+  r.sensor(End::UPPER, true);  // reaches the top: upper is healthy
+  CHECK(r.d.pending(Dir::UP) == 1, "untrusted entry not counted as completed");
+  r.until(b + 9000);
+  r.sensor(End::UPPER, false);
+  r.until(b + 9000 + r.d.settings().hold_min_ms - 500);
+  CHECK(r.d.phase() == Phase::HOLD, "still lit for hold_min after real activity, got %s", r.d.phase_text());
+  CHECK(r.run_until_phase(Phase::IDLE, 60000) != UINT32_MAX, "then resolves to idle");
+  r.d.clear_faults(r.now);
+  CHECK(!r.d.sensor_fault(End::LOWER), "manual clear");
+}
+
 static void t_preview() {
   printf("color preview\n");
   Rig r;
@@ -525,6 +591,9 @@ int main(int argc, char **argv) {
   t_two_people_same_dir();
   t_crossing();
   t_ambiguous_crossing();
+  t_chatter_fault_from_log();
+  t_stuck_sensor();
+  t_faulted_sensor_still_wakes();
   t_preview();
   t_simulation();
   t_wraparound();

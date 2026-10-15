@@ -1,142 +1,793 @@
-# Stairwell Lighting (stair_engine) v3.0
+# Stairwell Lighting (stair_engine)
 
-Direction-aware, sectioned stair lighting for ESPHome. All behavior lives in a
-framework-free C++ core (`components/stair_engine`) that compiles on the host
-for testing and is portable to a bare ESP-IDF product firmware later.
+Direction-aware, sectioned LED stair lighting for ESPHome and Home Assistant.
 
-| Item | Value |
+Walk up and the stairs light ahead of you from the bottom. Walk down and they
+light from the top. When you reach the other end they turn off behind you, in
+the direction you walked. A ball rolling past a sensor gets its own short
+"incidental" animation instead of a full light show. Every section has its own
+color, every action has its own effect, and the hold time learns how long your
+household actually takes on the stairs.
+
+All behavior lives in a small C++ engine that compiles and runs on a PC for
+testing (271 automated checks), then runs unchanged on an ESP8266 or ESP32.
+
+![version](https://img.shields.io/badge/version-3.1-blue) ![esphome](https://img.shields.io/badge/ESPHome-%E2%89%A52026.9.0-black) ![boards](https://img.shields.io/badge/boards-ESP8266%20%7C%20ESP32-green)
+
+---
+
+## Contents
+
+- [Features](#features)
+- [How it works](#how-it-works)
+- [Hardware](#hardware)
+- [Wiring and pinouts](#wiring-and-pinouts)
+- [Storage room light (future)](#storage-room-light-future)
+- [Build and flash](#build-and-flash)
+- [Home Assistant / Web UI settings](#home-assistant--web-ui-settings)
+- [Effects](#effects)
+- [Using it](#using-it)
+- [Why it is built this way](#why-it-is-built-this-way)
+- [Troubleshooting](#troubleshooting)
+- [Testing](#testing)
+- [Project files](#project-files)
+- [Extending](#extending)
+- [Known limits](#known-limits)
+- [Roadmap](#roadmap)
+- [Changelog](#changelog)
+
+---
+
+## Features
+
+- **Three actions, handled differently:** going up, going down, and incidental
+  triggers (pets, a ball, a sensor glitch).
+- **Sections:** the strip is split into independently colored sections. This
+  install uses three: lower flight, landing, upper flight. Up to 8 are supported.
+- **Live per-section color** from a Home Assistant color wheel. Changing a color
+  lights just that section for 5 seconds so you can see it in place.
+- **Effect per action** from a dropdown. Effects never contain colors; they only
+  shape brightness, and color always comes from the section.
+- **Hold until confirmed:** lights stay on until the person is seen arriving at
+  the other end. No fixed timer turns the lights off on a slow climber.
+- **Learned backstop:** for trips that never complete (turn-backs, false
+  triggers), the timeout adapts to how long real trips take in your home.
+- **Grace dim:** before giving up, the stairs dim instead of snapping off. Any
+  motion brings them straight back.
+- **Sensor fault detection:** a false-triggering or stuck PIR is flagged in Home
+  Assistant and can no longer hold the lights on forever.
+- **Ambient gating:** optional daylight suppression from any HA lux sensor.
+- **Simulate buttons** to demo or test every action without walking the stairs.
+- **Dual target:** one YAML file builds for ESP8266 or ESP32.
+- **Future storage room light:** a PIR-controlled 12 V white strip on the same
+  controller, enabled with one line in the config.
+
+---
+
+## How it works
+
+### Architecture
+
+```mermaid
+flowchart LR
+    subgraph Inputs
+        PL[Lower PIR]
+        PU[Upper PIR]
+        LX[HA lux sensor]
+        UI[HA / Web UI<br/>colors, effects, timing]
+    end
+    subgraph Engine["stair_engine (C++)"]
+        DIR[Director<br/>state machine<br/>trip tracking<br/>learning, faults]
+        FX[Effects<br/>brightness only]
+        CMP[Compositor<br/>brightness x section color]
+    end
+    PL --> DIR
+    PU --> DIR
+    LX --> DIR
+    UI --> DIR
+    UI --> CMP
+    DIR --> FX --> CMP
+    CMP --> DRV[LED driver<br/>RMT or NeoPixelBus]
+    DRV --> LS[74AHCT125<br/>3.3 V to 5 V]
+    LS --> STRIP[WS2811 strip<br/>58 px]
+```
+
+### Lighting phases
+
+```mermaid
+stateDiagram-v2
+    [*] --> idle
+    idle --> enter: new entry at an end
+    idle --> preview: color changed
+    preview --> idle: 5 s then fade out
+    preview --> enter: motion
+    enter --> hold: effect done
+    hold --> exit: all trips done and sensors clear
+    hold --> grace: trips still open after backstop
+    grace --> restore: any motion
+    grace --> incidental: grace period over
+    exit --> restore: motion
+    incidental --> restore: motion
+    restore --> hold
+    exit --> idle: effect done
+    incidental --> idle: effect done
+```
+
+### Trip tracking
+
+With only two sensors there is no way to see what happens mid-stairs, so the
+engine keeps a short queue of open trips per direction:
+
+- A trigger at the bottom with no open "down" trip is a **new up trip**.
+- A trigger at the top while an "up" trip is open (and at least 0.8 s old) is
+  that trip **completing**. The time it took is recorded for learning.
+- Lights exit only when **every** trip has completed and both sensors are clear.
+
+Two people, someone turning back, or a ball all leave trips open. Those are
+resolved by the backstop: hold, then grace dim, then the incidental effect.
+
+### Learned backstop
+
+Each completed trip time is stored (the last 16 per direction, saved to flash at
+most once a minute). The backstop is:
+
+```
+backstop = 2 x (90th percentile trip time), clamped to [Hold Minimum, Hold Maximum]
+```
+
+Until 3 trips have been learned in a direction, Hold Maximum is used. Simulated
+trips never train it. Example: if your trips up take 4 to 6 s, the backstop is
+about 12 s, raised to the 20 s Hold Minimum.
+
+### Sensor faults
+
+A PIR that keeps firing with nobody there would otherwise hold the lights on
+indefinitely. The engine flags a sensor as faulted when either:
+
+- it produces **5 new entries within 3 minutes, none of which complete**, or
+- it stays **continuously active for 5 minutes**.
+
+While faulted, that sensor can still **wake dark stairs** (a real person is
+never left in the dark), but it cannot hold them on, add phantom trips, or
+complete trips. Trips started by it time out at Hold Minimum. The fault clears
+automatically after 10 quiet minutes, or with the Clear Sensor Faults button.
+
+---
+
+## Hardware
+
+### Installed controller (v3.1)
+
+| Part | Notes |
 |---|---|
-| MCU | ESP32 WROOM-32 (`esp32dev`), ESP-IDF toolchain |
-| ESPHome | >= 2026.9.0 (validated against 2026.9.1) |
-| LEDs | WS2811 12 V, BRG, 58 pixels, one data line |
-| Sensors | PIR lower + PIR upper; ambient lux from Home Assistant |
+| HiLetgo NodeMCU v1.0 (ESP8266MOD, ESP-12E, CP2102) | 4 MB flash. ESPHome board `nodemcuv2` |
+| NodeMCU screw-terminal carrier board | with a perfboard area |
+| SN74AHCT125N | 3.3 V to 5 V level shifter for LED data, powered from 5 V |
+| Buck converter module, 12 V to 5 V | feeds NodeMCU VIN and the 74AHCT125 |
+| 12 V power supply | LED strip and buck input |
+| WS2811 12 V addressable strip | 58 pixels (driver ICs), BRG order |
+| 2x AM312 mini PIR | 3.3 V, about 15 uA, fixed ~2 s output pulse |
+| 4-core cable per sensor | red +, white -, green signal, blue ground guard |
+| WAGO 221 lever connectors | power distribution |
+| Enclosure | |
 
-## Install
+### Recommended additions
+
+| Part | Qty | Where | Why |
+|---|---|---|---|
+| 100 nF ceramic capacitor | 1 | 74AHCT125 pin 14 to pin 7 | local decoupling for the shifter |
+| 100 ohm resistor | 1 per PIR | in series with PIR + at the sensor | RC filter (see below) |
+| 100 uF electrolytic capacitor | 1 per PIR | PIR VCC to GND at the sensor | RC filter |
+| 100 nF ceramic capacitor | 1 per PIR | PIR VCC to GND at the sensor | RC filter, high frequency |
+| 10 kohm resistor | 1 | 74AHCT125 pin 5 to GND | keeps the storage gate low while the ESP boots |
+
+### Optional ESP32 build
+
+ESP32 WROOM-32 (`esp32dev`), ESP-IDF, RMT LED driver. Same engine and features,
+a higher frame rate, and internal pulldowns on the PIR pins. Set `board: esp32`.
+
+---
+
+## Wiring and pinouts
+
+### System overview
+
+```mermaid
+flowchart TB
+    PSU[12 V PSU] --> W12[WAGO 12 V +]
+    PSU --> WG[WAGO GND]
+    W12 --> BUCK[Buck 12 V to 5 V]
+    WG --> BUCK
+    W12 --> STRIP[WS2811 strip +12 V]
+    WG --> STRIPG[WS2811 strip GND]
+    BUCK -- 5 V --> VIN[NodeMCU VIN]
+    BUCK -- 5 V --> SHV[74AHCT125 VCC pins 10, 13, 14]
+    BUCK -- GND --> NG[NodeMCU GND bottom left]
+
+    D2[NodeMCU D2 GPIO4] --> S2[74AHCT125 pin 2, 1A]
+    S3[74AHCT125 pin 3, 1Y] --> DATA[WS2811 data in]
+
+    D1[NodeMCU D1 GPIO5] --> S5[74AHCT125 pin 5, 2A]
+    S6[74AHCT125 pin 6, 2Y] -. future .-> MOS[MOSFET gate, storage strip]
+
+    LP[Lower AM312] -- signal --> D7[NodeMCU D7 GPIO13]
+    UP[Upper AM312] -- signal --> D6[NodeMCU D6 GPIO12]
+    SP[Storage AM312] -. future .-> D5[NodeMCU D5 GPIO14]
+```
+
+### NodeMCU carrier terminals (as installed)
+
+Right-hand block, top to bottom:
+
+| Terminal | GPIO | Connection | Notes |
+|---|---|---|---|
+| D0 | 16 | none | tied to the onboard LED, avoid for inputs |
+| D1 | 5 | 74AHCT125 pin 5 (2A) | storage strip control (future). Driven LOW by firmware |
+| D2 | 4 | 74AHCT125 pin 2 (1A) | stair strip data |
+| D3 | 0 | none (old temp sensor harness removed) | boot pin, keep free |
+| D4 | 2 | none | boot pin, avoid |
+| 3V3 | | lower PIR + (red) | through the RC filter at the sensor |
+| GND | | lower PIR - (white) and lower guard (blue) | guard grounded here only |
+| D5 | 14 | none | reserved for the storage PIR (future) |
+| D6 | 12 | upper PIR signal (green) | |
+| D7 | 13 | lower PIR signal (green) | |
+| D8 | 15 | none | boot pin, avoid |
+| RX | 3 | none | alternate DMA pin for the stair strip |
+| TX | 1 | none | serial log output |
+| GND | | upper PIR - (white) | |
+| 3V3 | | none | |
+
+Left-hand block:
+
+| Terminal | Connection |
+|---|---|
+| VIN | 5 V from the buck converter |
+| 3V3 | upper PIR + (red), through the RC filter at the sensor |
+| GND (top) | upper guard (blue) |
+| GND (bottom) | GND from the buck converter |
+
+All GND terminals are the same net. Each guard conductor is grounded **at the
+controller end only**; leave the far end unconnected.
+
+### 74AHCT125 level shifter
+
+```
+               +---\/---+
+ 1OE   GND    -|1     14|- VCC  5 V
+ 1A    D2     -|2     13|- 4OE  5 V   (gate 4 disabled)
+ 1Y    strip  -|3     12|- 4A   GND
+ 2OE   GND    -|4     11|- 4Y   n/c
+ 2A    D1     -|5     10|- 3OE  5 V   (gate 3 disabled)
+ 2Y    MOSFET -|6      9|- 3A   GND
+ GND          -|7      8|- 3Y   n/c
+               +--------+
+```
+
+| Gate | Input | Output | State |
+|---|---|---|---|
+| 1 | D2 / GPIO4 | WS2811 data | active |
+| 2 | D1 / GPIO5 | storage MOSFET gate (future) | active, input held LOW by firmware |
+| 3 | GND | n/c | disabled (OE high) |
+| 4 | GND | n/c | disabled (OE high) |
+
+OE is active LOW: a gate is enabled when its OE pin is grounded.
+
+### PIR sensor wiring with RC filter
+
+The AM312 is known to false-trigger from supply ripple, and the NodeMCU's 3.3 V
+regulator also feeds the ESP8266, whose Wi-Fi bursts pull hundreds of mA. The
+AM312 draws only about 15 uA, so a series resistor plus capacitors **at the
+sensor** filters the ripple with a negligible 1.5 mV drop:
+
+```
+ controller end                          sensor end
+ 3V3  ------ red ------[ 100 ohm ]---+------+------ AM312 VCC
+                                     |      |
+                                  100 uF  100 nF
+                                     |      |
+ GND  ------ white ------------------+------+------ AM312 GND
+ GPIO ------ green -------------------------------- AM312 OUT
+ GND  ------ blue (guard) ------------------- x     (far end NOT connected)
+```
+
+The filter corner is about 16 Hz.
+
+---
+
+## Storage room light (future)
+
+A plain 12 V white strip (two wires, + and -) only needs on and off with a fade,
+so it does not need an addressable strip. A logic-level N-channel MOSFET
+switches its negative side. The existing 74AHCT125 gate 2 provides a 5 V gate
+drive, which fully turns on common logic-level MOSFETs. PWM from the ESP gives
+smooth fades.
+
+### Parts
+
+| Part | Example | Notes |
+|---|---|---|
+| Logic-level N-MOSFET, TO-220 | IRLZ44N (used here) or IRLB8721PbF | do **not** use IRF520 modules; they are not logic-level |
+| Gate resistor | 100 ohm | limits ringing |
+| Gate pulldown | 10 kohm, gate to source | the MOSFET stays off if the drive is lost |
+| Boot pulldown | 10 kohm, 74AHCT125 pin 5 to GND | gate 2 input stays LOW while GPIO5 floats during boot |
+| AM312 and RC filter | as above | wired to D5 |
+| 12 V white strip | | check its current draw against the PSU |
+
+An IRLB8721 runs cool with no heatsink up to several amps. LED strips need no
+flyback diode.
+
+### Storage wiring
+
+```mermaid
+flowchart LR
+    V12[12 V +] --> SP[White strip +]
+    SN[White strip -] --> DR[MOSFET drain]
+    SRC[MOSFET source] --> GND[GND]
+    Y2[74AHCT125 pin 6, 2Y] --> RG[100 ohm] --> G[MOSFET gate]
+    G --> RPD[10 kohm] --> SRC
+    D1[NodeMCU D1 GPIO5] --> A2[74AHCT125 pin 5, 2A]
+    A2 --> RBP[10 kohm] --> GND
+    SPIR[Storage AM312 signal] --> D5[NodeMCU D5 GPIO14]
+```
+
+```
+ 12 V + -------------------------------- strip +
+                                         strip - ---- D (drain)
+ 74AHCT125 pin 6 ---[100 ohm]---+------------------- G (gate)
+                                |
+                             [10 kohm]
+                                |
+ GND ---------------------------+------------------- S (source)
+
+ IRLB8721 / IRLZ44N, TO-220, facing the label: G D S (left to right)
+```
+
+### Enabling it
+
+1. Wire the MOSFET, strip, and PIR as above.
+2. In `stairwell-2boards.yaml`, set `storage_installed: true`.
+3. Flash. New entities appear: **Storage Light**, **Storage Motion**,
+   **Storage Off Delay**, **Storage Brightness**, **Storage Motion Control**.
+
+Behavior: motion fades the light up to Storage Brightness over 1 s. When motion
+clears, a restartable timer waits Storage Off Delay, then fades out over 2 s.
+New motion during the wait cancels the timer. Turn off Storage Motion Control
+to run the light manually from Home Assistant.
+
+Until `storage_installed` is true, the firmware still drives GPIO5 LOW from
+boot, so gate 2 never sees a floating input.
+
+| Board | Storage LED pin | Storage PIR pin | PWM |
+|---|---|---|---|
+| esp8266 | GPIO5 (D1) | GPIO14 (D5) | `esp8266_pwm`, 1 kHz |
+| esp32 | GPIO19 | GPIO25 | `ledc`, 1 kHz |
+
+---
+
+## Build and flash
+
+### Requirements
+
+- ESPHome **2026.9.0 or newer** (the board selection uses Jinja substitutions
+  with dictionary values).
+- `components/` next to the YAML file (local external component).
+
+### Configure
+
+Edit the top of `stairwell-2boards.yaml`:
+
+```yaml
+substitutions:
+  board: esp8266           # esp8266 | esp32
+  storage_installed: false # true once the storage hardware is wired
+  name: stairwell
+  friendly_name: Stairwell
+  lux_entity: sensor.hue_motion_sensor_1_illuminance
+```
+
+Secrets:
 
 ```bash
-cp secrets.example.yaml secrets.yaml        # fill in; api key: openssl rand -base64 32
-esphome config stairwell.yaml               # validate
-esphome run stairwell.yaml                  # first flash over USB, OTA afterwards
+cp secrets.example.yaml secrets.yaml
+openssl rand -base64 32    # paste as api_encryption_key
 ```
 
-`components/` must sit next to `stairwell.yaml` (local external component). OTA
-uses the API encryption key; the web server's plaintext `/update` is disabled.
+### Build
 
-## Wiring
+```bash
+esphome config  stairwell-2boards.yaml   # validate
+esphome compile stairwell-2boards.yaml   # build
+esphome run     stairwell-2boards.yaml   # flash and follow logs
+```
 
-| Function | GPIO | Notes |
+### First flash: use USB
+
+The previous firmware on this NodeMCU was built for a 1 MB layout (`esp01_1m`),
+so its OTA updater sees too little free space for v3. Flash once over USB.
+After that, OTA works normally. Settings from v2 do not carry over, and v2
+entities can be removed from Home Assistant.
+
+### Security defaults
+
+- API traffic is encrypted with `api_encryption_key`.
+- OTA uploads use the same key (`ota: encryption: {}`); there is no OTA password.
+- The web server's plaintext `/update` endpoint is disabled.
+
+---
+
+## Home Assistant / Web UI settings
+
+Everything below appears in Home Assistant and on the device's built-in web
+page (`http://stairwell.local`).
+
+### Colors
+
+| Entity | Type | What it does |
 |---|---|---|
-| LED data | 18 | 74AHCT125 level shifter recommended (3.3 V -> 5 V logic) |
-| Upper PIR | 32 | internal pulldown enabled |
-| Lower PIR | 33 | internal pulldown enabled |
+| Lower Flight Color | light | color wheel = section color, brightness = section level, off = section disabled |
+| Landing Color | light | same, for the landing |
+| Upper Flight Color | light | same, for the upper flight |
 
-Do not reuse the old ESP8266 pins: GPIO12 is an ESP32 strapping pin (a PIR
-holding it high at boot selects 1.8 V flash and boot-loops). Avoid 0, 2, 5,
-12, 15 (strapping) and 6-11 (flash). Common ground between the 12 V supply
-and the ESP32 is required.
+Examples:
+- Warm white stairs with a blue landing: set both flights to a warm white and the
+  landing to blue. Each change previews that section for 5 s.
+- A dimmer landing: drop Landing Color brightness to 30%.
+- Skip the landing entirely: turn Landing Color off.
 
-## Layout
+### Effects
 
-Sections are declared bottom to top in `stair_engine:`. A landing is a
-section whose steps are step-equivalents. Rules (validated at compile time):
-`pixels` must be a multiple of `pixels_per_step`, sections must not overlap
-or exceed `num_pixels`. Set `reversed: true` if a section's pixel index
-increases toward the bottom. Max 8 sections.
+| Entity | Options | Example |
+|---|---|---|
+| Up Effect | Cascade, Soft Wipe, Comet, Fade | Comet for a playful climb |
+| Down Effect | Cascade, Soft Wipe, Comet, Fade | Soft Wipe for a calm descent |
+| Incidental Effect | Retreat, Firefly, Ripple, Breath | Firefly for the cat's 3 a.m. visits |
+| Effect Speed | 25 to 200 % | 150 % makes every effect 1.5x faster |
 
-```
-Lower Flight  px  0-15   2 px/step   steps  0-7
-Landing       px 16-51   9 px/step   steps  8-11
-Upper Flight  px 52-57   2 px/step   steps 12-14
-```
+### Timing and behavior
 
-Adding a section: add it under `stair_engine: sections:` and add a matching
-color light whose `set_section_color(N, ...)` index equals its position.
+| Entity | Default | Range | What it does |
+|---|---|---|---|
+| Master Brightness | 100 % | 5 to 100 % | scales everything; lower it to cap power or for a dimmer default |
+| Hold Minimum | 20 s | 5 to 120 s | the backstop never goes below this |
+| Hold Maximum | 60 s | 10 to 300 s | backstop ceiling, and the backstop until 3 trips are learned. Wins if it conflicts with Hold Minimum |
+| Grace Period | 8 s | 2 to 30 s | how long the stairs stay dimmed before the incidental effect |
+| Grace Level | 35 % | 5 to 80 % | brightness during grace |
+| Exit Delay | 1.5 s | 0 to 10 s | pause after the last sensor clears before the exit effect |
+| Ambient Gating | off | switch | when on, new activations are blocked while lux is at or above the threshold |
+| Ambient Threshold | 75 lx | 0 to 500 lx | daylight level for gating |
 
-## Behavior
+Examples:
+- Someone in the house is slow on the stairs: raise Hold Minimum to 45 s.
+- Lights linger too long after a ball rolls by: lower Hold Maximum to 30 s.
+  This also sets the timeout before enough real trips have been learned.
+- Stop the stairs lighting on a sunny afternoon: enable Ambient Gating, then set
+  Ambient Threshold just below your typical daytime reading. If the lux sensor
+  goes offline, gating fails open so the stairs still work.
 
-| Phase | Meaning |
+### Actions
+
+| Button | What it does |
 |---|---|
-| idle | dark |
-| enter | traversal effect lights the stairs in the direction of travel |
-| hold | fully lit until every entry is matched by an arrival at the far end |
-| exit | traversal effect turns off following the direction of travel |
-| grace | unresolved past the backstop: dims, any motion restores |
-| incidental | creative off effect after grace |
-| restore | motion during grace/exit/incidental brings lights back up |
-| preview | a color change lights only that section for 5 s |
+| Simulate Up / Down | runs a full scripted trip (about 8 s) with the current effects |
+| Simulate Incidental | runs the incidental path with a short backstop (about 7 s) |
+| Reset Learned Timing | clears trip history; the backstop returns to Hold Maximum |
+| Clear Sensor Faults | clears both fault flags immediately |
+| Restart | reboots the controller |
 
-**Traversal tracking.** An arrival at an end completes the oldest open trip
-heading toward it, otherwise it opens a new trip. Lights exit only when no
-trips are open and both sensors are clear for Exit Delay. Two people, a
-turn-back, or a ball all keep trips open, so the backstop decides.
+Simulations are refused while the stairs are in use and never train learning.
 
-**Learned backstop.** Each confirmed trip time is stored (16 per direction,
-persisted to flash at most once a minute). Backstop = 2 x p90 trip time,
-clamped to Hold Minimum..Hold Maximum (Maximum wins if they conflict). Fewer
-than 3 samples uses Hold Maximum. Simulations never train it.
+### Status and diagnostics
 
-**Chatter.** A re-trigger within 1.5 s of that sensor clearing is the same
-presence. Arrivals in the first 3 s after boot are ignored (PIR settle).
-
-**Ambient gating.** When enabled, blocks only NEW activations while lux >=
-threshold. Unknown lux (HA offline) fails open: lights still work.
-
-## Home Assistant entities
-
-| Entity | Purpose |
+| Entity | What it shows |
 |---|---|
-| Lower Flight / Landing / Upper Flight Color | color = hue, brightness = section level, off = section disabled |
-| Up Effect / Down Effect | Cascade, Soft Wipe, Comet, Fade |
-| Incidental Effect | Retreat, Firefly, Ripple, Breath |
-| Effect Speed, Master Brightness | look |
-| Hold Minimum / Maximum, Grace Period / Level, Exit Delay | timing |
-| Ambient Gating, Ambient Threshold | daylight suppression |
-| Simulate Up / Down / Incidental | demo or test without walking the stairs |
-| Reset Learned Timing | clears trip history |
-| State, Last Event | live phase and the latest decision, with reason |
-| Learned Hold Up/Down, Learned Samples Up/Down | diagnostics |
-| Lower Motion, Upper Motion | raw PIR state |
+| State | idle, preview, enter, hold, grace, exit, incidental, restore |
+| Last Event | the engine's latest decision and why, e.g. `up complete in 5.2s (0/0 pending)` |
+| Lower Motion / Upper Motion | raw PIR state |
+| Lower / Upper Sensor Fault | problem flag (see [Sensor faults](#sensor-faults)) |
+| Learned Hold Up / Down | current backstop per direction, in seconds |
+| Learned Samples Up / Down | how many trips have been learned (max 16) |
+| WiFi Signal, Uptime | health |
 
-Select option order is a contract with the `Style` / `IncidentalStyle` enums
-in `stair_effects.h`. Add new effects to both, in the same position.
+---
 
-## Host tests
+## Effects
+
+Effects output brightness only. Color is applied afterward from each section,
+so every effect works with any color scheme. Durations are at 100 % speed on
+this 15-step layout.
+
+### Up / Down
+
+Each has a matching exit that turns the stairs off following your direction.
+
+| Effect | Look | Duration |
+|---|---|---|
+| Cascade | steps light one after another with a soft fade | about 1.9 s |
+| Soft Wipe | a smooth, soft-edged front sweeps along the stairs | about 1.4 s |
+| Comet | a bright head runs ahead, the trail settles from dim to full | about 1.8 s |
+| Fade | the whole staircase fades together | 0.8 s |
+
+### Incidental
+
+These start from whatever is lit and end dark.
+
+| Effect | Look |
+|---|---|
+| Retreat | a brief "looking around" shimmer, then the light withdraws toward where the trigger came from |
+| Firefly | pixels drift into a twinkle and wink out one by one |
+| Ripple | a decaying wave rolls away from the trigger end |
+| Breath | the staircase exhales, takes a small breath, and fades |
+
+Run `make show` in `tools/sim` to see ASCII frames of every effect.
+
+---
+
+## Using it
+
+1. **Walk the stairs normally** for a few days. After 3 trips each way the
+   backstop starts adapting (watch Learned Samples).
+2. **Pick colors** with the three color entities. Each change previews in place.
+3. **Pick effects** per action. Use the Simulate buttons to compare them without
+   walking the stairs.
+4. **Tune** Hold Minimum if anyone is slow on the stairs, and Hold Maximum if
+   incidental triggers linger.
+5. **Watch Last Event** when something looks wrong. It records each decision
+   and the reason.
+
+Example Home Assistant automation, dimmer stairs at night:
+
+```yaml
+automation:
+  - alias: Stairs night brightness
+    triggers:
+      - trigger: time
+        at: "22:30:00"
+    actions:
+      - action: number.set_value
+        target:
+          entity_id: number.stairwell_master_brightness
+        data:
+          value: 40
+  - alias: Stairs day brightness
+    triggers:
+      - trigger: time
+        at: "06:30:00"
+    actions:
+      - action: number.set_value
+        target:
+          entity_id: number.stairwell_master_brightness
+        data:
+          value: 100
+```
+
+Example, get notified when a sensor misbehaves:
+
+```yaml
+automation:
+  - alias: Stair sensor fault
+    triggers:
+      - trigger: state
+        entity_id:
+          - binary_sensor.stairwell_lower_sensor_fault
+          - binary_sensor.stairwell_upper_sensor_fault
+        to: "on"
+    actions:
+      - action: notify.notify
+        data:
+          message: "Stairwell PIR fault: {{ trigger.to_state.name }}"
+```
+
+Entity IDs depend on your device name; check them in Home Assistant.
+
+---
+
+## Why it is built this way
+
+**C++ engine instead of YAML lambdas.** v2 kept effects in YAML lambdas that
+coordinated through shared globals (`effect_finished`, `system_state`), which
+caused race conditions: lights stuck on, and lights turning off on a slow
+climber about 9 s after they left the bottom sensor. The engine has a single
+state machine, compiles on a PC for testing, and only its glue layer touches
+ESPHome APIs, so it can move to a bare ESP-IDF firmware later.
+
+**Effects cannot produce color.** Effects return brightness per pixel; color is
+applied in one place. A hard-coded color inside an effect is impossible, not
+just discouraged.
+
+**One permanent render effect.** The strip runs a single "Engine" effect and
+the engine draws every frame. No effect switching, no handshakes between
+effects.
+
+**Hold until confirmed, not a timer.** A fixed timeout is the main way stair
+lights fail people: too short and the lights go out mid-climb, too long and
+they waste power. Waiting for the far end, with a learned backstop for the
+unresolved cases, gets both right.
+
+**Faulted sensors can wake, but not hold.** Safety first: a real person must
+never be left in the dark, but a broken sensor must not keep the lights on all
+night.
+
+**Virtual color lights.** Each section's color is a normal HA light entity
+that drives no hardware, so you get a native color wheel and brightness slider.
+The engine reads its target values directly.
+
+**Pin choices.** On ESP32, GPIO12 is a strapping pin that selects 1.8 V flash
+when held high at boot (a PIR can do that), so the PIRs use GPIO32/33. On
+ESP8266, GPIO0, 2 and 15 are boot pins and are kept off sensors.
+
+**Level shifter.** The ESP outputs 3.3 V logic; WS2811 data and a MOSFET gate
+both want 5 V. The 74AHCT125 is fast enough for 800 kHz LED data and accepts
+3.3 V inputs at a 5 V supply.
+
+**RC filter on PIR power.** Cheaper and more effective than a separate
+regulator, because the AM312 draws almost nothing.
+
+---
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Last Event repeats `up entry at lower` with nobody there | AM312 false triggers from supply ripple or RF | add the RC filter at the sensor; ground the guard at the controller; keep wires off the ESP antenna; test with `output_power: 13dB` under `wifi:` |
+| A Sensor Fault turns on | the above, or a stuck sensor | fix the cause; the flag auto-clears after 10 quiet minutes |
+| Lights do not react at all | ambient gating active | check Ambient Gating and Ambient Threshold against the lux reading |
+| Board will not boot | a sensor or harness on GPIO0, GPIO2 or GPIO15 | disconnect it; see the pin tables |
+| Wi-Fi or API drops on ESP8266 | bit-banged LED output blocking interrupts | move stair data to GPIO3 and add `method: esp8266_dma`, or raise `update_interval` to 40 ms |
+| Weak Wi-Fi (around -70 dBm) | wires or copper over the module antenna | reroute so nothing sits within 15 mm of the antenna |
+| OTA fails with "not enough space" | first update from v2's 1 MB layout | flash once over USB |
+| Log says `Lit but no frames rendered` | strip light not running the Engine effect | reboot; the effect is started at boot |
+| Colors look wrong | channel order | the stair strip is BRG; adjust `type:` or `channel_colors:` |
+
+To tell a bad GPIO from a bad sensor, swap the two PIR signal wires at the
+board. If the problem follows the wire, it is the sensor or cable. If it stays
+on the same input, it is the pin.
+
+---
+
+## Testing
+
+The core engine has no ESPHome dependencies and is tested on a PC:
 
 ```bash
 cd tools/sim
-make          # builds with -Wall -Wextra -Wconversion -Werror and runs 256 checks
-make show     # ASCII frames of every effect
+make          # build with -Wall -Wextra -Wconversion -Werror and run all checks
+make show     # also print ASCII frames of every effect
 ```
 
-Covers traversals, slow climber, incidental path, learned hold, grace
-restore, boot settle, gating, chatter, two people, crossing, preview,
-simulation, millis() rollover, and effect bounds/continuity at 0.5x-2x speed.
+271 checks cover: up and down trips, the slow climber, the incidental path,
+learned hold, grace restore, boot settle, ambient gating, PIR chatter, two
+people, crossing traffic, the false-trigger pattern from a real field log,
+stuck sensors, faulted sensors still waking dark stairs, color preview,
+simulation, `millis()` rollover, and every effect's bounds and continuity at
+0.5x to 2x speed.
 
-## Architecture
+Validation status of this release:
+
+| Check | Status |
+|---|---|
+| Host tests | 271 / 271 pass |
+| `esphome config` (ESP8266 and ESP32, storage on and off) | valid on 2026.9.1 |
+| Glue code against ESPHome 2026.9.1 headers | compiles (syntax check) |
+| Full firmware compile | run `esphome compile` locally |
+
+---
+
+## Project files
 
 ```
-PIR / lux / HA entities --(YAML lambdas)--> StairEngine (ESPHome glue)
-                                               |
-                       Director: state machine, trip queues, learning
-                       Effects:  intensity per pixel (no color possible)
-                       Compose:  intensity x section color x brightness
-                                               |
-                         addressable_lambda "Engine" --> RMT --> WS2811
+.
+├── stairwell-2boards.yaml         device config (ESP8266 or ESP32)
+├── secrets.example.yaml           template for secrets.yaml
+├── README.md
+├── .gitignore
+├── components/
+│   └── stair_engine/
+│       ├── __init__.py            ESPHome schema, layout validation, code generation
+│       ├── stair_engine.h/.cpp    ESPHome glue (the only ESPHome-dependent code)
+│       ├── stair_director.h/.cpp  state machine, trip tracking, learning, faults, simulation
+│       ├── stair_effects.h/.cpp   effects (brightness only)
+│       ├── stair_geometry.h/.cpp  sections, steps, pixel positions
+│       └── stair_compose.h        brightness x section color
+└── tools/
+    └── sim/
+        ├── sim.cpp                host tests and ASCII effect viewer
+        └── Makefile
 ```
 
-Only `stair_engine.h/.cpp` touch ESPHome APIs (Component, millis, preferences,
-AddressableLight writes). Everything else is plain C++20.
+---
 
-## Known limits (two PIR endpoints)
+## Extending
 
-- A ball and a slow climber look identical until the backstop, so incidental
-  resolves after hold + grace, not instantly. `Director::report_incidental()`
-  is ready for ToF/mmWave nodes that classify on their own.
-- A crossing within ~0.8 s is detected; a crossing that looks like a fast
-  completed trip can briefly exit, then relights the moment the far end
-  triggers. A mid-stair presence sensor removes this.
+### Change the layout
 
-## Removed from v2
+Sections are listed bottom to top under `stair_engine:`:
 
-Storage light/PIR, DHT11, the GPIO5 "Platform Color Picker" strip, `sun:`,
-and all effects with hard-coded colors.
+```yaml
+stair_engine:
+  id: stairs
+  num_pixels: 58
+  sections:
+    - name: Lower Flight
+      first_pixel: 0
+      pixels: 16
+      pixels_per_step: 2
+    - name: Landing
+      first_pixel: 16
+      pixels: 36
+      pixels_per_step: 9      # a landing is just a section of step-equivalents
+    - name: Upper Flight
+      first_pixel: 52
+      pixels: 6
+      pixels_per_step: 2
+      # reversed: true         # if pixel index increases toward the bottom here
+```
+
+Rules, checked at compile time: `pixels` must be a multiple of
+`pixels_per_step`, sections must not overlap or run past `num_pixels`, and at
+most 8 sections. Each section needs a color light whose
+`set_section_color(N, ...)` index matches its position in the list.
+
+### Add an effect
+
+1. Implement a class in `stair_effects.cpp` with `name()`, `duration()` and
+   `render()`. Write brightness in [0, 1] per pixel; there is no color to set.
+2. Add it to the `Style` or `IncidentalStyle` enum and the matching switch.
+3. Add its name to the select's `options:` **in the same position** as the enum.
+4. Add a case to `t_effect_math` and run `make`.
+
+---
+
+## Known limits
+
+These come from having only two endpoint PIR sensors.
+
+- **Incidental triggers resolve slowly.** A ball and a slow climber look the
+  same until the backstop expires, so incidental plays after hold plus grace,
+  not instantly. `Director::report_incidental()` is ready for sensors that can
+  classify on their own (ToF, mmWave).
+- **Crossing traffic can be ambiguous.** Two people crossing so that it looks
+  like one fast completed trip can cause a brief exit. The stairs relight the
+  moment the far end triggers. A mid-stair presence sensor removes this.
+- **A faulted sensor degrades gracefully, not perfectly.** Trips it starts
+  cannot be confirmed by the other end, so they time out at Hold Minimum.
+
+---
+
+## Roadmap
+
+Product direction for this design:
+
+- ToF (VL53L1X) end sensors with two detection zones: direction plus incidental
+  classification within about 100 ms, instead of after the backstop.
+- Smart sensor nodes on an RS-485 bus, so mid-stair or landing sensors become
+  plug-in additions.
+- ESP32-S3 controller with PSRAM, a custom PCB, and a 24 V LED rail with
+  switched power for true zero standby draw.
+- RGBW and RGB+CCT strip support through a per-output color mapper.
+- Optional Matter support (per-section lights, stair sensors as occupancy).
+- Speed-adaptive cascades that keep pace with the person.
+
+---
+
+## Changelog
+
+### v3.1
+- Sensor fault detection: chatter (5 unconfirmed entries in 3 min) and stuck
+  (5 min active). Faulted sensors wake but cannot hold. New fault entities and
+  a Clear Sensor Faults button.
+- Lower PIR moved to GPIO13 (D7). GPIO14 (D5) reserved for the storage PIR.
+- GPIO5 driven LOW from boot so the level shifter's gate 2 never floats.
+- Future storage room light behind `storage_installed`.
+- ESP8266 board set to `nodemcuv2` (matches the installed NodeMCU v1.0).
+- Default board is now `esp8266`.
+- `stairwell.yaml` (ESP32-only) retired; `stairwell-2boards.yaml` covers both.
+
+### v3.0
+- Rewrite: C++ `stair_engine` with trip tracking, learned backstop, grace dim,
+  per-section colors, effects per action, simulations, and host tests.
+- Dual-target YAML. Encrypted OTA, web OTA disabled.
+- Removed: storage light on the old GPIO2 wiring, DHT11, `sun:`, and effects
+  with hard-coded colors.
+
+### v2.0
+- ESPHome YAML with lambdas on ESP8266 (`esp01_1m`), two color presets.

@@ -53,11 +53,16 @@ struct Settings {
   int16_t fx_up{-1};
   int16_t fx_down{-1};
   int16_t fx_incidental{-1};
+  // Ambient mode: what idle looks like. Off = dark (classic behavior).
+  bool ambient{false};
+  int16_t fx_ambient{-1};
+  float ambient_level{0.30f};       // ceiling, pre-gamma (0.30 is about 3% real output at gamma 2.8)
+  uint32_t ambient_fade_ms{2000};   // fade into / out of ambient
   // Per-section traversal override for relays; -1 = follow the action's effect.
   int16_t section_fx[MAX_SECTIONS]{-1, -1, -1, -1, -1, -1, -1, -1};
   // Preview
   uint32_t preview_ms{5000};
-  // Ambient gating (blocks NEW activations only)
+  // Daylight gating (blocks NEW activations only)
   bool gating{false};
   float lux_threshold{75.0f};
 };
@@ -89,7 +94,7 @@ class Director {
 
   // ---- effect selection by registry name. Returns false (and changes nothing) if
   // the name is not a registered effect of the right kind.
-  enum class Slot : uint8_t { UP, DOWN, INCIDENTAL };
+  enum class Slot : uint8_t { UP, DOWN, INCIDENTAL, AMBIENT };
   bool select_effect(Slot slot, const char *name, size_t len);
   // Section override: "Follow Action" (or empty) clears it.
   bool select_section_effect(uint8_t section, const char *name, size_t len);
@@ -102,7 +107,11 @@ class Director {
 
   // ---- status
   Phase phase() const { return this->phase_; }
-  const char *phase_text() const { return phase_name(this->phase_); }
+  const char *phase_text() const {
+    return (this->phase_ == Phase::IDLE && (this->s_.ambient || this->ambient_env_ > 0.0f)) ? "ambient"
+                                                                                           : phase_name(this->phase_);
+  }
+  float ambient_envelope() const { return this->ambient_env_; }
   const char *last_event() const { return this->event_; }
   uint32_t event_seq() const { return this->event_seq_; }
   uint8_t pending(Dir d) const { return this->q_[qi(d)].n; }
@@ -214,6 +223,11 @@ class Director {
   float lux_{NAN};
 
   uint32_t preview_until_{0};
+
+  float ambient_env_{0.0f};
+  uint32_t ambient_t0_{0};
+  uint32_t last_tick_{0};
+  bool ticked_{false};
 
   std::vector<float> from_;
   std::vector<float> last_;

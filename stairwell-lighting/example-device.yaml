@@ -1,0 +1,23 @@
+# ==============================================================================
+# Your device file: paste THIS into the ESPHome dashboard as your device config.
+# Your settings live here and survive updates. On a new release, replace only
+# stairwell-lighting/stairwell-lighting.yaml (and components/ when it changed).
+#
+# ESPHome config folder (e.g. /config/esphome in Home Assistant):
+#   secrets.yaml
+#   stairwell-lighting.yaml             <- this file (your dashboard device)
+#   stairwell-lighting/
+#     stairwell-lighting.yaml           <- full config from the release
+#   components/
+#     stair_engine/                     <- engine source from the release
+# ==============================================================================
+
+substitutions:
+  name: stairwell-lighting          # keep your current device name (changing it re-adds the device in HA)
+  friendly_name: Stairwell
+  board: esp8266                    # esp8266 | esp32
+  storage_installed: true           # storage light (MOSFET strip) wired
+  lux_entity: sensor.hue_motion_sensor_1_illuminance
+
+packages:
+  stairwell: !include stairwell-lighting/stairwell-lighting.yaml

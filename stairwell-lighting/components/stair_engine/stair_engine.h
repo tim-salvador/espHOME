@@ -53,6 +53,9 @@ class StairEngine : public Component {
   void set_incidental_effect(const char *name, size_t len) {
     this->select_(stair::Director::Slot::INCIDENTAL, name, len);
   }
+  void set_ambient_effect(const char *name, size_t len) { this->select_(stair::Director::Slot::AMBIENT, name, len); }
+  void set_ambient(bool on) { this->dir_.settings().ambient = on; }
+  void set_ambient_level_pct(float pct) { this->dir_.settings().ambient_level = clamp_(pct / 100.0f, 0.0f, 1.0f); }
   // Relay override for one section; "Follow Action" clears it.
   void set_section_effect(uint8_t section, const char *name, size_t len);
   void set_speed_pct(float pct) { this->dir_.settings().speed = clamp_(pct / 100.0f, 0.25f, 4.0f); }

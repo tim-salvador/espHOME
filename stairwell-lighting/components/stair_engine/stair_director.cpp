@@ -57,10 +57,13 @@ void Director::attach(const Geometry *geo) {
   if (this->s_.fx_up < 0) this->s_.fx_up = static_cast<int16_t>(reg.first(EffectKind::TRAVERSAL));
   if (this->s_.fx_down < 0) this->s_.fx_down = static_cast<int16_t>(reg.first(EffectKind::TRAVERSAL));
   if (this->s_.fx_incidental < 0) this->s_.fx_incidental = static_cast<int16_t>(reg.first(EffectKind::INCIDENTAL));
+  if (this->s_.fx_ambient < 0) this->s_.fx_ambient = static_cast<int16_t>(reg.first(EffectKind::AMBIENT));
 }
 
 bool Director::select_effect(Slot slot, const char *name, size_t len) {
-  const EffectKind kind = slot == Slot::INCIDENTAL ? EffectKind::INCIDENTAL : EffectKind::TRAVERSAL;
+  const EffectKind kind = slot == Slot::INCIDENTAL ? EffectKind::INCIDENTAL
+                          : slot == Slot::AMBIENT  ? EffectKind::AMBIENT
+                                                   : EffectKind::TRAVERSAL;
   const int idx = effects().find(kind, name, len);
   if (idx < 0) return false;
   switch (slot) {
@@ -72,6 +75,9 @@ bool Director::select_effect(Slot slot, const char *name, size_t len) {
       break;
     case Slot::INCIDENTAL:
       this->s_.fx_incidental = static_cast<int16_t>(idx);
+      break;
+    case Slot::AMBIENT:
+      this->s_.fx_ambient = static_cast<int16_t>(idx);
       break;
   }
   return true;
@@ -93,6 +99,7 @@ bool Director::select_section_effect(uint8_t section, const char *name, size_t l
 void Director::begin(uint32_t now) {
   this->started_ = true;
   this->boot_ms_ = now;
+  this->ambient_t0_ = now;
   this->last_activity_ = now;
   this->seed_ ^= now * 2654435761u;
   this->note_("ready");
@@ -167,7 +174,7 @@ void Director::sensor(End e, bool active, uint32_t now) {
 
 void Director::arrival_(End e, uint32_t now) {
   if (!this->lit_() && this->gated_() && !this->sim_fast_) {
-    this->note_("%s ignored: ambient %.0f lx >= %.0f", end_name(e), this->lux_, this->s_.lux_threshold);
+    this->note_("%s ignored: daylight %.0f lx >= %.0f", end_name(e), this->lux_, this->s_.lux_threshold);
     return;
   }
 
@@ -404,6 +411,27 @@ void Director::tick(uint32_t now) {
 
   if (this->geo_ == nullptr || !this->geo_->valid()) return;
 
+  // Ambient envelope: fades toward 1 while idle with ambient on, toward 0 when
+  // ambient is turned off; snaps to 0 whenever the stairs leave idle, so returning
+  // to idle always fades ambient back in from dark (exit effects end dark).
+  {
+    const uint32_t dt = this->ticked_ ? now - this->last_tick_ : 0;
+    this->last_tick_ = now;
+    this->ticked_ = true;
+    if (this->phase_ != Phase::IDLE) {
+      this->ambient_env_ = 0.0f;
+    } else {
+      const float step = this->s_.ambient_fade_ms > 0
+                             ? static_cast<float>(dt) / static_cast<float>(this->s_.ambient_fade_ms)
+                             : 1.0f;
+      if (this->s_.ambient) {
+        this->ambient_env_ = this->ambient_env_ + step > 1.0f ? 1.0f : this->ambient_env_ + step;
+      } else {
+        this->ambient_env_ = this->ambient_env_ - step < 0.0f ? 0.0f : this->ambient_env_ - step;
+      }
+    }
+  }
+
   for (uint8_t i = 0; i < 2; i++) {
     const End e = static_cast<End>(i);
     if (!this->fault_[i] && this->active_[i] && !this->booting_(now) &&
@@ -489,9 +517,24 @@ void Director::render(uint32_t now, float *levels) {
   const uint16_t n = this->geo_ == nullptr ? 0 : this->geo_->num_pixels();
   if (n == 0) return;
   switch (this->phase_) {
-    case Phase::IDLE:
-      std::fill(levels, levels + n, 0.0f);
+    case Phase::IDLE: {
+      const EffectRegistry &reg = effects();
+      const int16_t a = this->s_.fx_ambient;
+      if (this->ambient_env_ <= 0.0f || a < 0 || static_cast<size_t>(a) >= reg.size() ||
+          reg.at(a).kind != EffectKind::AMBIENT) {
+        std::fill(levels, levels + n, 0.0f);
+        break;
+      }
+      const Effect *fx = reg.at(a).enter;
+      const uint32_t period = fx->period() > 0 ? fx->period() : 1000;
+      // Fixed seed: the ambient pattern is the same every night. Speed does not apply.
+      EffectCtx c{this->geo_, Dir::UP, End::LOWER, (now - this->ambient_t0_) % period, 1.0f,
+                  this->from_.data(), 0xA3B1E5u, 0.0f};
+      fx->render(c, levels);
+      const float k = this->s_.ambient_level * this->ambient_env_;
+      for (uint16_t px = 0; px < n; px++) levels[px] *= k;
       break;
+    }
     case Phase::HOLD:
       for (uint16_t px = 0; px < n; px++) levels[px] = this->geo_->mapped(px) ? 1.0f : 0.0f;
       break;

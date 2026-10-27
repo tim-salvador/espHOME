@@ -504,6 +504,7 @@ static void t_effect_math() {
   const EffectRegistry &reg = effects();
   for (size_t i = 0; i < reg.size(); i++) {
     const EffectEntry &e = reg.at(static_cast<int>(i));
+    if (e.kind == EffectKind::AMBIENT) continue;  // checked in t_ambient_effects
     const bool inc = e.kind == EffectKind::INCIDENTAL;
     CHECK(e.enter != nullptr && (inc || e.exit != nullptr), "%s: has its variants", e.name);
     for (const Geometry *g : {&full, &landing}) {
@@ -520,6 +521,136 @@ static void t_effect_math() {
   }
 }
 
+static void t_ambient_effects() {
+  printf("ambient effects: bounds, never all dark, seamless loop\n");
+  Geometry g = make_geo();
+  const uint16_t n = g.num_pixels();
+  const EffectRegistry &reg = effects();
+  std::vector<float> from(n, 0.0f), a(n), b(n);
+  int count = 0;
+  for (size_t i = 0; i < reg.size(); i++) {
+    const EffectEntry &e = reg.at(static_cast<int>(i));
+    if (e.kind != EffectKind::AMBIENT) continue;
+    count++;
+    const Effect &fx = *e.enter;
+    const uint32_t P = fx.period();
+    CHECK(P > 0, "%s: periodic", e.name);
+    EffectCtx c{&g, Dir::UP, End::LOWER, 0, 1.0f, from.data(), 0xA3B1E5u, 0};
+    bool ok = true, unmapped_dark = true;
+    float max_mean = 0.0f, min_px = 1.0f;
+    const uint32_t stepms = P > 60000 ? 997 : 10;  // long loops: sample, short loops: dense
+    for (uint32_t t = 0; t < P; t += stepms) {
+      c.t = t;
+      fx.render(c, a.data());
+      float sum = 0;
+      for (uint16_t px = 0; px < n; px++) {
+        ok &= (a[px] >= 0.0f && a[px] <= 1.0f && !std::isnan(a[px]));
+        if (!g.mapped(px)) unmapped_dark &= a[px] == 0.0f;
+        sum += a[px];
+        if (g.mapped(px) && a[px] < min_px) min_px = a[px];
+      }
+      if (sum / 58.0f > max_mean) max_mean = sum / 58.0f;
+    }
+    CHECK(ok, "%s: levels within [0,1]", e.name);
+    CHECK(unmapped_dark, "%s: unmapped dark", e.name);
+    CHECK(max_mean > 0.05f, "%s: visible (max mean %.2f)", e.name, max_mean);
+    // Seam: the frame just before the wrap must match the frame at t=0.
+    c.t = P - 1;
+    fx.render(c, a.data());
+    c.t = 0;
+    fx.render(c, b.data());
+    float worst = 0;
+    for (uint16_t px = 0; px < n; px++) worst = fmaxf(worst, fabsf(a[px] - b[px]));
+    CHECK(worst < 0.05f, "%s: seamless loop (worst jump %.3f)", e.name, worst);
+    // Continuity inside the loop: no jumps between 20 ms frames.
+    float jump = 0;
+    for (uint32_t t = 0; t + 20 < (P < 60000 ? P : 60000); t += 20) {
+      c.t = t;
+      fx.render(c, a.data());
+      c.t = t + 20;
+      fx.render(c, b.data());
+      for (uint16_t px = 0; px < n; px++) jump = fmaxf(jump, fabsf(a[px] - b[px]));
+    }
+    CHECK(jump < 0.25f, "%s: smooth between frames (worst %.3f)", e.name, jump);
+  }
+  CHECK(count == 8, "8 ambient effects (%d)", count);
+}
+
+static void t_ambient_mode() {
+  printf("ambient mode: idle shows ambient, motion takes over seamlessly, fades back\n");
+  Rig r;
+  CHECK(r.d.select_effect(Director::Slot::AMBIENT, "Glow", 4), "select Glow");
+  CHECK(!r.d.select_effect(Director::Slot::AMBIENT, "Cascade", 7), "traversal name rejected for ambient");
+  r.advance(500);
+  CHECK(r.level_sum() == 0.0f, "ambient off: idle is dark");
+  CHECK(strcmp(r.d.phase_text(), "idle") == 0, "phase text idle");
+
+  r.d.settings().ambient = true;
+  r.advance(1000);
+  CHECK(r.lv[0] > 0.05f && r.lv[0] < 0.25f, "fading in at 1 s (%.3f)", r.lv[0]);
+  CHECK(strcmp(r.d.phase_text(), "ambient") == 0, "phase text ambient");
+  r.advance(1200);
+  CHECK(fabsf(r.lv[0] - 0.30f) < 0.01f && fabsf(r.lv[40] - 0.30f) < 0.01f, "at level after fade (%.3f)", r.lv[0]);
+
+  // Motion: enter starts from the ambient frame, far steps keep their ambient glow.
+  r.sensor(End::LOWER, true);
+  r.advance(40);
+  CHECK(r.d.phase() == Phase::ENTER, "enter from ambient");
+  CHECK(fabsf(r.lv[57] - 0.30f) < 0.02f, "top still at ambient while cascade starts (%.3f)", r.lv[57]);
+  CHECK(r.lv[0] >= 0.30f, "bottom rising from ambient, not from dark (%.3f)", r.lv[0]);
+  r.advance(1500);
+  r.sensor(End::LOWER, false);
+  r.advance(4000);
+  r.sensor(End::UPPER, true);
+  r.advance(1000);
+  r.sensor(End::UPPER, false);
+  CHECK(r.run_until_phase(Phase::IDLE, 10000) != UINT32_MAX, "back to idle");
+  r.advance(20);
+  CHECK(r.lv[0] < 0.02f, "exit ended dark, ambient restarting (%.3f)", r.lv[0]);
+  r.advance(2100);
+  CHECK(fabsf(r.lv[0] - 0.30f) < 0.01f, "ambient faded back in (%.3f)", r.lv[0]);
+
+  // Level and effect changes apply live.
+  r.d.settings().ambient_level = 0.5f;
+  r.advance(40);
+  CHECK(fabsf(r.lv[0] - 0.5f) < 0.01f, "level change live (%.3f)", r.lv[0]);
+  r.d.select_effect(Director::Slot::AMBIENT, "Landing Beacon", 14);
+  r.advance(40);
+  CHECK(r.lv[0] == 0.0f && r.lv[30] > 0.45f && r.lv[55] == 0.0f, "Landing Beacon: only the landing glows");
+
+  // Preview from ambient, then back to ambient.
+  r.d.select_effect(Director::Slot::AMBIENT, "Glow", 4);
+  r.advance(40);
+  r.d.preview(0, r.now);
+  r.advance(300);
+  CHECK(r.lv[0] > 0.99f && r.lv[30] < 0.05f, "preview shows only the previewed section");
+  CHECK(r.run_until_phase(Phase::IDLE, 8000) != UINT32_MAX, "preview ends");
+  r.advance(2200);
+  CHECK(fabsf(r.lv[30] - 0.5f) < 0.01f, "ambient resumes after preview (%.3f)", r.lv[30]);
+
+  // Simulation from ambient.
+  CHECK(r.d.simulate(SimAction::UP, r.now), "simulate allowed from ambient");
+  CHECK(r.run_until_phase(Phase::ENTER, 200) != UINT32_MAX, "sim starts");
+  CHECK(r.run_until_phase(Phase::IDLE, 20000) != UINT32_MAX, "sim ends");
+
+  // Turning ambient off fades out.
+  r.advance(2200);
+  r.d.settings().ambient = false;
+  r.advance(1000);
+  CHECK(r.lv[0] > 0.1f && r.lv[0] < 0.4f, "fading out at 1 s (%.3f)", r.lv[0]);
+  r.advance(1200);
+  CHECK(r.level_sum() == 0.0f, "dark after fade out");
+  CHECK(strcmp(r.d.phase_text(), "idle") == 0, "phase text back to idle");
+
+  // Gating still blocks activations while ambient runs.
+  r.d.settings().ambient = true;
+  r.d.settings().gating = true;
+  r.d.set_ambient_lux(500);
+  r.advance(2500);
+  r.sensor(End::UPPER, true);
+  CHECK(r.d.phase() == Phase::IDLE, "gated arrival ignored; ambient continues");
+}
+
 static void t_registry() {
   printf("registry and name-based selection\n");
   const EffectRegistry &reg = effects();
@@ -529,12 +660,17 @@ static void t_registry() {
             reg.at(static_cast<int>(i)).name);
   CHECK(strcmp(reg.at(reg.first(EffectKind::TRAVERSAL)).name, "Cascade") == 0, "default traversal is Cascade");
   CHECK(strcmp(reg.at(reg.first(EffectKind::INCIDENTAL)).name, "Retreat") == 0, "default incidental is Retreat");
-  const char *yaml_traversal[] = {"Cascade", "Soft Wipe", "Comet", "Fade", "Glitch", "Stagger", "Scatter"};
-  const char *yaml_incidental[] = {"Retreat", "Firefly", "Ripple", "Breath", "Peek", "Sonar"};
+  const char *yaml_traversal[] = {"Cascade", "Soft Wipe",  "Comet",        "Fade",    "Glitch",   "Stagger", "Scatter",
+                                  "Typewriter", "Bloom", "Bounce", "Sparkle Fill", "Curtain", "Lead Glow"};
+  const char *yaml_incidental[] = {"Retreat", "Firefly", "Ripple", "Breath", "Peek", "Sonar", "Shrug", "Ember"};
   for (const char *nm : yaml_traversal) CHECK(reg.find(EffectKind::TRAVERSAL, nm) >= 0, "YAML option %s registered", nm);
   for (const char *nm : yaml_incidental)
     CHECK(reg.find(EffectKind::INCIDENTAL, nm) >= 0, "YAML option %s registered", nm);
   CHECK(reg.find(EffectKind::TRAVERSAL, "Peek") < 0, "kinds are separate");
+  const char *yaml_ambient[] = {"Glow", "Guide", "Landing Beacon", "Breathe", "Tide", "Starfield", "Candle", "Ember Bed"};
+  for (const char *nm : yaml_ambient) CHECK(reg.find(EffectKind::AMBIENT, nm) >= 0, "YAML option %s registered", nm);
+  CHECK(strcmp(reg.at(reg.first(EffectKind::AMBIENT)).name, "Glow") == 0, "default ambient is Glow");
+  CHECK(reg.find(EffectKind::AMBIENT, "Cascade") < 0, "ambient kind separate");
 
   Rig r;
   CHECK(r.d.select_effect(Director::Slot::UP, "Glitch", 6), "select by name");
@@ -635,6 +771,28 @@ static void t_geometry() {
   CHECK(rev.step_along(0, Dir::UP) == 3, "reversed section maps pixel 0 to top");
 }
 
+static void t_rank() {
+  printf("per-pixel travel order\n");
+  Geometry g = make_geo();
+  CHECK(g.num_mapped() == 58, "58 mapped");
+  CHECK(g.rank_along(0, Dir::UP) == 0 && g.rank_along(57, Dir::UP) == 57, "up rank");
+  CHECK(g.rank_along(57, Dir::DOWN) == 0 && g.rank_along(0, Dir::DOWN) == 57, "down rank");
+  std::vector<int> seen(58, 0);
+  for (uint16_t px = 0; px < 58; px++) seen[g.rank_along(px, Dir::UP)]++;
+  bool unique = true;
+  for (int v : seen) unique &= v == 1;
+  CHECK(unique, "ranks unique");
+  Geometry land;
+  land.make_subset(g, 1, 1);
+  CHECK(land.num_mapped() == 36 && land.rank_along(16, Dir::UP) == 0 && land.rank_along(51, Dir::UP) == 35,
+        "landing subset ranks restart at 0");
+  Geometry rev;
+  rev.set_num_pixels(4);
+  rev.add_section("r", 0, 4, 1, true);
+  rev.finalize();
+  CHECK(rev.rank_along(3, Dir::UP) == 0 && rev.rank_along(0, Dir::UP) == 3, "reversed section rank");
+}
+
 static void t_compose() {
   printf("compositor\n");
   Geometry g = make_geo();
@@ -677,9 +835,12 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "--show") == 0) g_show = true;
 
   t_geometry();
+  t_rank();
   t_compose();
   t_effect_math();
   t_registry();
+  t_ambient_effects();
+  t_ambient_mode();
   t_relay();
   t_up_traversal();
   t_down_traversal();
@@ -704,6 +865,7 @@ int main(int argc, char **argv) {
     const EffectRegistry &reg = effects();
     for (size_t i = 0; i < reg.size(); i++) {
       const EffectEntry &e = reg.at(static_cast<int>(i));
+      if (e.kind == EffectKind::AMBIENT) continue;
       if (e.kind == EffectKind::TRAVERSAL) {
         show(e.name, *e.enter, Dir::UP, End::LOWER, false);
         show("  exit", *e.exit, Dir::UP, End::LOWER, true);

@@ -64,6 +64,16 @@ class Geometry {
   }
   // Distance along the direction of travel (0 where travel starts).
   float along(uint16_t px, Dir d) const { return this->pos_from(px, entry_end_of(d)); }
+  // Pixels that belong to a section.
+  uint16_t num_mapped() const { return this->num_mapped_; }
+  // Order of a mapped pixel along the direction of travel: 0 = first pixel reached,
+  // num_mapped()-1 = last. Unlike step_along(), this is unique per pixel.
+  uint16_t rank_along(uint16_t px, Dir d) const {
+    uint16_t r = this->px_rank_[px];
+    return d == Dir::UP ? r : static_cast<uint16_t>(this->num_mapped_ - 1 - r);
+  }
+  // Absolute step index from the bottom (0 = bottom step).
+  uint16_t step(uint16_t px) const { return this->px_step_[px]; }
   // Integer step index counted along the direction of travel.
   uint16_t step_along(uint16_t px, Dir d) const {
     uint16_t s = this->px_step_[px];
@@ -73,11 +83,13 @@ class Geometry {
  private:
   uint16_t num_pixels_{0};
   uint16_t num_steps_{0};
+  uint16_t num_mapped_{0};
   bool valid_{false};
   const char *error_{"not finalized"};
   std::vector<SectionDef> sections_;
   std::vector<uint8_t> px_section_;
   std::vector<uint16_t> px_step_;
+  std::vector<uint16_t> px_rank_;
   std::vector<float> px_pos_;
 };
 

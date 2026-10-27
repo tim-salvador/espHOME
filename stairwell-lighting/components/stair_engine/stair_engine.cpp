@@ -116,8 +116,11 @@ void StairEngine::set_section_color(uint8_t section, float r, float g, float b, 
 
 void StairEngine::select_(stair::Director::Slot slot, const char *name, size_t len) {
   if (!this->dir_.select_effect(slot, name, len)) {
-    ESP_LOGW(TAG, "Unknown %s effect '%.*s' (see the effect list in the boot log); keeping the current one",
-             slot == stair::Director::Slot::INCIDENTAL ? "incidental" : "traversal", static_cast<int>(len), name);
+    const char *kind = slot == stair::Director::Slot::INCIDENTAL ? "incidental"
+                       : slot == stair::Director::Slot::AMBIENT  ? "ambient"
+                                                                 : "traversal";
+    ESP_LOGW(TAG, "Unknown %s effect '%.*s' (see the effect list in the boot log); keeping the current one", kind,
+             static_cast<int>(len), name);
   }
 }
 
@@ -159,9 +162,13 @@ void StairEngine::dump_config() {
   ESP_LOGCONFIG(TAG, "  Effects (select option text must match exactly):");
   for (size_t i = 0; i < reg.size(); i++) {
     const stair::EffectEntry &e = reg.at(static_cast<int>(i));
-    ESP_LOGCONFIG(TAG, "    %-11s %s%s%s%s", e.kind == stair::EffectKind::TRAVERSAL ? "traversal" : "incidental",
-                  e.name, static_cast<int>(i) == st.fx_up ? "  [up]" : "", static_cast<int>(i) == st.fx_down ? "  [down]" : "",
-                  static_cast<int>(i) == st.fx_incidental ? "  [incidental]" : "");
+    const char *kind = e.kind == stair::EffectKind::TRAVERSAL    ? "traversal"
+                       : e.kind == stair::EffectKind::INCIDENTAL ? "incidental"
+                                                                 : "ambient";
+    const int idx = static_cast<int>(i);
+    ESP_LOGCONFIG(TAG, "    %-11s %s%s%s%s%s", kind, e.name, idx == st.fx_up ? "  [up]" : "",
+                  idx == st.fx_down ? "  [down]" : "", idx == st.fx_incidental ? "  [incidental]" : "",
+                  idx == st.fx_ambient ? "  [ambient]" : "");
   }
   for (uint8_t i = 0; i < this->geo_.num_sections(); i++) {
     if (st.section_fx[i] >= 0)

@@ -27,9 +27,11 @@ bool Geometry::finalize() {
 
   this->px_section_.assign(this->num_pixels_, NO_SECTION);
   this->px_step_.assign(this->num_pixels_, 0);
+  this->px_rank_.assign(this->num_pixels_, 0);
   this->px_pos_.assign(this->num_pixels_, 0.0f);
 
   uint16_t step_cursor = 0;
+  uint16_t rank_cursor = 0;
   for (uint8_t si = 0; si < this->sections_.size(); si++) {
     SectionDef &s = this->sections_[si];
     if (s.pixels == 0 || s.pixels_per_step == 0) {
@@ -47,6 +49,8 @@ bool Geometry::finalize() {
     s.first_step = step_cursor;
     s.steps = s.pixels / s.pixels_per_step;
     step_cursor += s.steps;
+    const uint16_t section_rank_base = rank_cursor;
+    rank_cursor = static_cast<uint16_t>(rank_cursor + s.pixels);
 
     for (uint16_t k = 0; k < s.pixels; k++) {
       uint16_t px = s.first_pixel + k;
@@ -57,12 +61,14 @@ bool Geometry::finalize() {
       // k_up: index counted upward from the bottom of this section.
       uint16_t k_up = s.reversed ? static_cast<uint16_t>(s.pixels - 1 - k) : k;
       this->px_section_[px] = si;
+      this->px_rank_[px] = static_cast<uint16_t>(section_rank_base + k_up);
       this->px_step_[px] = s.first_step + k_up / s.pixels_per_step;
       this->px_pos_[px] =
           static_cast<float>(s.first_step) + (static_cast<float>(k_up) + 0.5f) / static_cast<float>(s.pixels_per_step);
     }
   }
   this->num_steps_ = step_cursor;
+  this->num_mapped_ = rank_cursor;
   if (this->num_steps_ == 0) {
     this->error_ = "no steps";
     return false;

@@ -215,11 +215,305 @@ class Sonar final : public Effect {
   float per_step(const EffectCtx &c) const { return ms(110.0f, c.speed); }
 };
 
+// Typewriter: pixels land one at a time in travel order, each with a bright
+// tick, settling dim; the whole staircase then rises to full. Exit clicks pixels
+// off one by one. Cadence adapts so long strips still finish in about 1.8 s.
+class Typewriter final : public Effect {
+ public:
+  explicit Typewriter(bool on) : on_(on) {}
+  const char *name() const override { return "Typewriter"; }
+  uint32_t duration(const EffectCtx &c) const override {
+    const float n = static_cast<float>(c.geo->num_mapped());
+    return static_cast<uint32_t>((n - 1.0f) * per_px(c) + tick(c) + (this->on_ ? ramp(c) : 0.0f));
+  }
+  uint32_t handoff(const EffectCtx &c) const override {
+    return static_cast<uint32_t>(static_cast<float>(c.geo->num_mapped()) * per_px(c));
+  }
+  void render(const EffectCtx &c, float *out) const override {
+    const float t = static_cast<float>(c.t);
+    const float all_landed = (static_cast<float>(c.geo->num_mapped()) - 1.0f) * per_px(c) + tick(c);
+    const float rise = smooth((t - all_landed) / ramp(c));
+    for (uint16_t px = 0; px < n_px(c); px++) {
+      if (!c.geo->mapped(px)) {
+        out[px] = 0.0f;
+        continue;
+      }
+      const float tp = t - static_cast<float>(c.geo->rank_along(px, c.dir)) * per_px(c);
+      float v;
+      if (this->on_) {
+        v = tp < 0.0f ? c.from[px] : (tp < tick(c) ? 1.0f : 0.7f);
+        v = lerp(v, 1.0f, rise);
+      } else {
+        v = tp < 0.0f ? c.from[px] : (tp < tick(c) ? c.from[px] * 0.35f : 0.0f);
+      }
+      out[px] = clamp01(v);
+    }
+  }
+
+ private:
+  float per_px(const EffectCtx &c) const {
+    const float n = static_cast<float>(c.geo->num_mapped());
+    const float base = 1800.0f / (n > 1.0f ? n : 1.0f);
+    return ms(base < 28.0f ? base : 28.0f, c.speed);
+  }
+  float tick(const EffectCtx &c) const { return ms(70.0f, c.speed); }
+  float ramp(const EffectCtx &c) const { return ms(300.0f, c.speed); }
+  bool on_;
+};
+
+// Bloom: steps light in travel order, each opening from its center outward.
+// Made for wide steps such as the 9-pixel landing. Exit closes each step from
+// its edges inward.
+class Bloom final : public Effect {
+ public:
+  explicit Bloom(bool on) : on_(on) {}
+  const char *name() const override { return "Bloom"; }
+  uint32_t duration(const EffectCtx &c) const override {
+    return static_cast<uint32_t>((n_steps(c) - 1.0f) * gap(c) + open(c) + fade(c));
+  }
+  uint32_t handoff(const EffectCtx &c) const override { return static_cast<uint32_t>(n_steps(c) * gap(c)); }
+  void render(const EffectCtx &c, float *out) const override {
+    const float t = static_cast<float>(c.t);
+    for (uint16_t px = 0; px < n_px(c); px++) {
+      if (!c.geo->mapped(px)) {
+        out[px] = 0.0f;
+        continue;
+      }
+      const float pos = c.geo->pos(px);
+      const float d = fabsf((pos - floorf(pos)) - 0.5f) * 2.0f;  // 0 at step center, 1 at its edge
+      const float k = static_cast<float>(c.geo->step_along(px, c.dir));
+      const float start = k * gap(c) + (this->on_ ? d : 1.0f - d) * open(c);
+      out[px] = toward(c, px, this->on_, smooth((t - start) / fade(c)));
+    }
+  }
+
+ private:
+  float gap(const EffectCtx &c) const { return ms(110.0f, c.speed); }
+  float open(const EffectCtx &c) const { return ms(260.0f, c.speed); }
+  float fade(const EffectCtx &c) const { return ms(200.0f, c.speed); }
+  bool on_;
+};
+
+// Bounce: a soft front races to the far end at partial brightness, bounces,
+// and a second front returns to fill everything to full. Exit: the first front
+// dims, the return front turns everything off.
+class Bounce final : public Effect {
+ public:
+  explicit Bounce(bool on) : on_(on) {}
+  const char *name() const override { return "Bounce"; }
+  uint32_t duration(const EffectCtx &c) const override { return static_cast<uint32_t>(2.0f * leg(c)); }
+  uint32_t handoff(const EffectCtx &c) const override {
+    return static_cast<uint32_t>(leg(c) * n_steps(c) / (n_steps(c) + EDGE));
+  }
+  void render(const EffectCtx &c, float *out) const override {
+    const float t = static_cast<float>(c.t);
+    const float n = n_steps(c);
+    const float f1 = (t / leg(c)) * (n + EDGE);                 // outbound front
+    const float f2 = ((t - leg(c)) / leg(c)) * (n + EDGE);      // return front, measured from the far end
+    for (uint16_t px = 0; px < n_px(c); px++) {
+      if (!c.geo->mapped(px)) {
+        out[px] = 0.0f;
+        continue;
+      }
+      const float a = c.geo->along(px, c.dir);
+      const float s1 = smooth((f1 - a) / EDGE);
+      const float s2 = t < leg(c) ? 0.0f : smooth((f2 - (n - a)) / EDGE);
+      if (this->on_) {
+        const float first = lerp(c.from[px], 0.55f, s1);
+        out[px] = clamp01(lerp(c.from[px] > first ? c.from[px] : first, 1.0f, s2));
+      } else {
+        out[px] = clamp01(c.from[px] * lerp(1.0f, 0.45f, s1) * (1.0f - s2));
+      }
+    }
+  }
+
+ private:
+  static constexpr float EDGE = 1.5f;
+  float leg(const EffectCtx &c) const {
+    const float base = n_steps(c) * 60.0f;
+    return ms(base < 450.0f ? 450.0f : base, c.speed);
+  }
+  bool on_;
+};
+
+// Sparkle Fill: random pixels pop on with a bright flash and settle, denser
+// near you first, until the stairs are full. Exit winks pixels off at random,
+// nearest first.
+class SparkleFill final : public Effect {
+ public:
+  explicit SparkleFill(bool on) : on_(on) {}
+  const char *name() const override { return "Sparkle Fill"; }
+  uint32_t duration(const EffectCtx &c) const override {
+    return static_cast<uint32_t>(fill(c) + flash(c) + (this->on_ ? ramp(c) : 0.0f));
+  }
+  uint32_t handoff(const EffectCtx &c) const override { return static_cast<uint32_t>(fill(c) * 0.6f); }
+  void render(const EffectCtx &c, float *out) const override {
+    const float t = static_cast<float>(c.t);
+    const float n = n_steps(c);
+    const float rise = smooth((t - fill(c) - flash(c)) / ramp(c));
+    for (uint16_t px = 0; px < n_px(c); px++) {
+      if (!c.geo->mapped(px)) {
+        out[px] = 0.0f;
+        continue;
+      }
+      const float bias = c.geo->along(px, c.dir) / (n > 0.0f ? n : 1.0f);  // 0 near you, 1 far
+      const float start = (0.55f * bias + 0.45f * rand01(c.seed, px, 41)) * fill(c);
+      const float tp = t - start;
+      float v;
+      if (this->on_) {
+        v = tp < 0.0f ? c.from[px] : (tp < flash(c) ? 1.0f : 0.75f);
+        v = lerp(v, 1.0f, rise);
+      } else {
+        v = tp < 0.0f ? c.from[px] : c.from[px] * (1.0f - smooth(tp / flash(c)));
+      }
+      out[px] = clamp01(v);
+    }
+  }
+
+ private:
+  float fill(const EffectCtx &c) const {
+    const float base = n_steps(c) * 90.0f;
+    return ms(base < 700.0f ? 700.0f : base, c.speed);
+  }
+  float flash(const EffectCtx &c) const { return ms(80.0f, c.speed); }
+  float ramp(const EffectCtx &c) const { return ms(300.0f, c.speed); }
+  bool on_;
+};
+
+// Curtain: light closes in from both ends and meets in the middle; exit opens a
+// dark gap in the middle that spreads to both ends. Ignores direction.
+class Curtain final : public Effect {
+ public:
+  explicit Curtain(bool on) : on_(on) {}
+  const char *name() const override { return "Curtain"; }
+  uint32_t duration(const EffectCtx &c) const override { return static_cast<uint32_t>(total(c)); }
+  uint32_t handoff(const EffectCtx &c) const override { return static_cast<uint32_t>(total(c) * 0.5f); }
+  void render(const EffectCtx &c, float *out) const override {
+    const float half = n_steps(c) / 2.0f;
+    const float front = (static_cast<float>(c.t) / total(c)) * (half + EDGE);
+    for (uint16_t px = 0; px < n_px(c); px++) {
+      if (!c.geo->mapped(px)) {
+        out[px] = 0.0f;
+        continue;
+      }
+      const float p = c.geo->pos(px);
+      const float to_end = p < n_steps(c) - p ? p : n_steps(c) - p;  // distance to the nearest end
+      const float d = this->on_ ? to_end : half - to_end;              // exit grows from the middle
+      out[px] = toward(c, px, this->on_, smooth((front - d) / EDGE));
+    }
+  }
+
+ private:
+  static constexpr float EDGE = 1.5f;
+  float total(const EffectCtx &c) const {
+    const float base = (n_steps(c) / 2.0f + EDGE) * 120.0f;
+    return ms(base < 500.0f ? 500.0f : base, c.speed);
+  }
+  bool on_;
+};
+
+// Lead Glow: a fast, dim front scouts the path ahead, then the full light
+// follows. Exit: a fast front dims everything, then a slower one turns it off.
+class LeadGlow final : public Effect {
+ public:
+  explicit LeadGlow(bool on) : on_(on) {}
+  const char *name() const override { return "Lead Glow"; }
+  uint32_t duration(const EffectCtx &c) const override { return static_cast<uint32_t>(slow(c)); }
+  uint32_t handoff(const EffectCtx &c) const override {
+    return static_cast<uint32_t>(slow(c) * n_steps(c) / (n_steps(c) + EDGE));
+  }
+  void render(const EffectCtx &c, float *out) const override {
+    const float t = static_cast<float>(c.t);
+    const float span = n_steps(c) + EDGE;
+    const float ff = (t / fast(c)) * span, fs = (t / slow(c)) * span;
+    for (uint16_t px = 0; px < n_px(c); px++) {
+      if (!c.geo->mapped(px)) {
+        out[px] = 0.0f;
+        continue;
+      }
+      const float a = c.geo->along(px, c.dir);
+      const float s1 = smooth((ff - a) / EDGE), s2 = smooth((fs - a) / EDGE);
+      if (this->on_) {
+        const float scout = lerp(c.from[px], 0.35f, s1);
+        out[px] = clamp01(lerp(c.from[px] > scout ? c.from[px] : scout, 1.0f, s2));
+      } else {
+        out[px] = clamp01(c.from[px] * lerp(1.0f, 0.35f, s1) * (1.0f - s2));
+      }
+    }
+  }
+
+ private:
+  static constexpr float EDGE = 2.0f;
+  float fast(const EffectCtx &c) const { return ms((n_steps(c) + EDGE) * 40.0f, c.speed); }
+  float slow(const EffectCtx &c) const {
+    const float base = (n_steps(c) + EDGE) * 105.0f;
+    return ms(base < 600.0f ? 600.0f : base, c.speed);
+  }
+  bool on_;
+};
+
+// Shrug (incidental): two quick dim blinks, then a fade out.
+class Shrug final : public Effect {
+ public:
+  const char *name() const override { return "Shrug"; }
+  uint32_t duration(const EffectCtx &c) const override { return static_cast<uint32_t>(ms(1500.0f, c.speed)); }
+  void render(const EffectCtx &c, float *out) const override {
+    const float t = static_cast<float>(c.t);
+    const float b = ms(120.0f, c.speed);  // each half-blink
+    float k;
+    if (t < 4.0f * b) {
+      const float phase = fmodf(t, 2.0f * b);
+      k = phase < b ? lerp(1.0f, 0.2f, smooth(phase / b)) : lerp(0.2f, 1.0f, smooth((phase - b) / b));
+    } else {
+      k = 1.0f - smooth((t - 4.0f * b) / (ms(1500.0f, c.speed) - 4.0f * b));
+    }
+    for (uint16_t px = 0; px < n_px(c); px++) out[px] = c.geo->mapped(px) ? c.from[px] * k : 0.0f;
+  }
+};
+
+// Ember (incidental): the stairs smoulder with slow, uneven flicker like dying
+// coals, each pixel burning out at its own pace.
+class Ember final : public Effect {
+ public:
+  const char *name() const override { return "Ember"; }
+  uint32_t duration(const EffectCtx &c) const override { return static_cast<uint32_t>(life(c)); }
+  void render(const EffectCtx &c, float *out) const override {
+    const float t = static_cast<float>(c.t);
+    const float in = smooth(t / ms(300.0f, c.speed));
+    const float bucket_ms = ms(180.0f, c.speed);
+    const uint32_t b = static_cast<uint32_t>(t / bucket_ms);
+    const float frac = smooth((t - static_cast<float>(b) * bucket_ms) / bucket_ms);
+    for (uint16_t px = 0; px < n_px(c); px++) {
+      if (!c.geo->mapped(px)) {
+        out[px] = 0.0f;
+        continue;
+      }
+      // Smooth value noise: blend this bucket's random level into the next one's.
+      const float noise = lerp(rand01(c.seed, px, 600 + b), rand01(c.seed, px, 601 + b), frac);
+      const float flicker = 0.6f + 0.7f * noise;
+      const float own_life = life(c) * (0.6f + 0.4f * rand01(c.seed, px, 42));
+      const float env = 1.0f - smooth(t / own_life);
+      out[px] = clamp01(c.from[px] * env * lerp(1.0f, flicker, in));
+    }
+  }
+
+ private:
+  float life(const EffectCtx &c) const { return ms(3200.0f, c.speed); }
+};
+
 const Glitch GLITCH_ON(true), GLITCH_OFF(false);
 const Stagger STAGGER_ON(true), STAGGER_OFF(false);
 const Scatter SCATTER_ON(true), SCATTER_OFF(false);
 const Peek PEEK;
 const Sonar SONAR;
+const Typewriter TYPEWRITER_ON(true), TYPEWRITER_OFF(false);
+const Bloom BLOOM_ON(true), BLOOM_OFF(false);
+const Bounce BOUNCE_ON(true), BOUNCE_OFF(false);
+const SparkleFill SPARKLE_ON(true), SPARKLE_OFF(false);
+const Curtain CURTAIN_ON(true), CURTAIN_OFF(false);
+const LeadGlow LEAD_ON(true), LEAD_OFF(false);
+const Shrug SHRUG;
+const Ember EMBER;
 
 }  // namespace
 
@@ -227,8 +521,16 @@ void register_custom_effects(EffectRegistry &reg) {
   reg.add_traversal("Glitch", &GLITCH_ON, &GLITCH_OFF);
   reg.add_traversal("Stagger", &STAGGER_ON, &STAGGER_OFF);
   reg.add_traversal("Scatter", &SCATTER_ON, &SCATTER_OFF);
+  reg.add_traversal("Typewriter", &TYPEWRITER_ON, &TYPEWRITER_OFF);
+  reg.add_traversal("Bloom", &BLOOM_ON, &BLOOM_OFF);
+  reg.add_traversal("Bounce", &BOUNCE_ON, &BOUNCE_OFF);
+  reg.add_traversal("Sparkle Fill", &SPARKLE_ON, &SPARKLE_OFF);
+  reg.add_traversal("Curtain", &CURTAIN_ON, &CURTAIN_OFF);
+  reg.add_traversal("Lead Glow", &LEAD_ON, &LEAD_OFF);
   reg.add_incidental("Peek", &PEEK);
   reg.add_incidental("Sonar", &SONAR);
+  reg.add_incidental("Shrug", &SHRUG);
+  reg.add_incidental("Ember", &EMBER);
 }
 
 }  // namespace stair

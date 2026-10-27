@@ -42,14 +42,18 @@ class Effect {
   // Relay hand-off: ms after start when the next section's effect should begin.
   // Effects with a moving front return the time the front reaches the far edge.
   virtual uint32_t handoff(const EffectCtx &c) const { return this->duration(c); }
+  // Ambient effects loop forever: the engine passes t modulo period(), so an
+  // effect whose motion repeats exactly every period() ms wraps seamlessly.
+  // 0 = not periodic (every non-ambient effect).
+  virtual uint32_t period() const { return 0; }
 };
 
-enum class EffectKind : uint8_t { TRAVERSAL, INCIDENTAL };
+enum class EffectKind : uint8_t { TRAVERSAL, INCIDENTAL, AMBIENT };
 
 struct EffectEntry {
   const char *name;
   EffectKind kind;
-  const Effect *enter;  // TRAVERSAL: light up. INCIDENTAL: the effect itself.
+  const Effect *enter;  // TRAVERSAL: light up. INCIDENTAL / AMBIENT: the effect itself.
   const Effect *exit;   // TRAVERSAL: turn off. INCIDENTAL: nullptr.
 };
 
@@ -57,6 +61,7 @@ class EffectRegistry {
  public:
   void add_traversal(const char *name, const Effect *enter, const Effect *exit);
   void add_incidental(const char *name, const Effect *fx);
+  void add_ambient(const char *name, const Effect *fx);
 
   // Exact, case-sensitive match on the display name. -1 when not found.
   int find(EffectKind kind, const char *name, size_t len) const;
@@ -73,6 +78,7 @@ class EffectRegistry {
 const EffectRegistry &effects();
 
 void register_builtin_effects(EffectRegistry &reg);
+void register_ambient_effects(EffectRegistry &reg);
 void register_custom_effects(EffectRegistry &reg);
 
 // Engine utility effects (not user-selectable).

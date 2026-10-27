@@ -1,5 +1,5 @@
 # ==============================================================================
-# Stairwell Lighting v3.2.2 (stair_engine): dual-target ESP8266 / ESP32
+# Stairwell Lighting v3.4.0 (stair_engine): dual-target ESP8266 / ESP32
 #
 #   board:             esp8266 (NodeMCU v1.0 / ESP-12E, the installed unit) | esp32
 #   storage_installed: false until the storage-room PIR + white strip are wired
@@ -37,9 +37,11 @@ substitutions:
             id: stair_strip
             name: Strip Driver
             internal: true
-            pin: GPIO4           # D2 -> 74AHCT125 gate 1 (pin 2 in, pin 3 out)
-            # Bit-bang blocks interrupts ~1.8 ms per frame. If Wi-Fi/API drops
-            # appear, move data to GPIO3 (RX) and add:  method: esp8266_dma
+            pin: GPIO3           # RX -> 74AHCT125 gate 1 (pin 2 in, pin 3 out)
+            # DMA (I2S hardware) is required: ESP8266 PWM for the storage light runs
+            # in a non-maskable interrupt that corrupts bit-banged LED data (random
+            # RGB twinkle). DMA only works on GPIO3.
+            method: esp8266_dma
             num_leds: 58
             variant: WS2811
             type: BRG
@@ -123,9 +125,8 @@ substitutions:
                 switch.is_on: storage_auto
               then:
                 - script.stop: storage_off_timer
-                - light.turn_on:
-                    id: storage_light
-                    brightness: !lambda 'return id(storage_brightness).state / 100.0f;'
+                # No brightness given: uses the Storage Light's last-set brightness.
+                - light.turn_on: storage_light
         on_release:
           - if:
               condition:
@@ -153,18 +154,6 @@ substitutions:
         optimistic: true
         restore_value: true
         entity_category: config
-      - platform: template
-        id: storage_brightness
-        name: Storage Brightness
-        icon: mdi:brightness-6
-        unit_of_measurement: "%"
-        min_value: 5
-        max_value: 100
-        step: 5
-        initial_value: 100
-        optimistic: true
-        restore_value: true
-        entity_category: config
     switch:
       - platform: template
         id: storage_auto
@@ -177,7 +166,7 @@ substitutions:
 packages:
   board_hw: ${ hw.package }
   storage_output: ${ storage_output_pkg }
-  storage: ${ storage_pkg if storage_installed else {} }
+  storage: ${ storage_pkg if (storage_installed | string | lower) == 'true' else {} }
 
 esphome:
   name: ${name}
@@ -445,7 +434,7 @@ select:
   - platform: template
     name: Up Effect
     icon: mdi:stairs-up
-    options: [Cascade, Soft Wipe, Comet, Fade, Glitch, Stagger, Scatter]
+    options: [Cascade, Soft Wipe, Comet, Fade, Glitch, Stagger, Scatter, Typewriter, Bloom, Bounce, Sparkle Fill, Curtain, Lead Glow]
     initial_option: Cascade
     optimistic: true
     restore_value: true
@@ -455,7 +444,7 @@ select:
   - platform: template
     name: Down Effect
     icon: mdi:stairs-down
-    options: [Cascade, Soft Wipe, Comet, Fade, Glitch, Stagger, Scatter]
+    options: [Cascade, Soft Wipe, Comet, Fade, Glitch, Stagger, Scatter, Typewriter, Bloom, Bounce, Sparkle Fill, Curtain, Lead Glow]
     initial_option: Cascade
     optimistic: true
     restore_value: true
@@ -465,19 +454,30 @@ select:
   - platform: template
     name: Incidental Effect
     icon: mdi:shimmer
-    options: [Retreat, Firefly, Ripple, Breath, Peek, Sonar]
+    options: [Retreat, Firefly, Ripple, Breath, Peek, Sonar, Shrug, Ember]
     initial_option: Retreat
     optimistic: true
     restore_value: true
     on_value:
       - lambda: id(stairs).set_incidental_effect(x.c_str(), x.size());
 
+  # Ambient: what idle looks like when Ambient Mode is on.
+  - platform: template
+    name: Ambient Effect
+    icon: mdi:weather-night
+    options: [Glow, Guide, Landing Beacon, Breathe, Tide, Starfield, Candle, Ember Bed]
+    initial_option: Glow
+    optimistic: true
+    restore_value: true
+    on_value:
+      - lambda: id(stairs).set_ambient_effect(x.c_str(), x.size());
+
   # Relay: the action's effect carries you to the landing, the landing runs its
   # own effect, then hands back. "Follow Action" = no override. Section 1 = Landing.
   - platform: template
     name: Landing Effect
     icon: mdi:stairs-box
-    options: [Follow Action, Cascade, Soft Wipe, Comet, Fade, Glitch, Stagger, Scatter]
+    options: [Follow Action, Cascade, Soft Wipe, Comet, Fade, Glitch, Stagger, Scatter, Typewriter, Bloom, Bounce, Sparkle Fill, Curtain, Lead Glow]
     initial_option: Follow Action
     optimistic: true
     restore_value: true
@@ -586,8 +586,24 @@ number:
     on_value:
       - lambda: id(stairs).set_exit_delay_s(x);
 
+  # Perceived brightness (before gamma): 30% is about 3.5% real output. Animated
+  # ambient effects look smoother at 40% and above (more 8-bit brightness steps).
   - platform: template
-    name: Ambient Threshold
+    name: Ambient Level
+    icon: mdi:brightness-4
+    unit_of_measurement: "%"
+    min_value: 10
+    max_value: 60
+    step: 5
+    initial_value: 30
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    on_value:
+      - lambda: id(stairs).set_ambient_level_pct(x);
+
+  - platform: template
+    name: Daylight Threshold
     icon: mdi:white-balance-sunny
     unit_of_measurement: lx
     min_value: 0
@@ -601,8 +617,18 @@ number:
       - lambda: id(stairs).set_lux_threshold(x);
 
 switch:
+  # Off: idle is dark. On: idle runs the Ambient Effect. Schedule it from Home
+  # Assistant (time, sun, lux) to make it a night light.
   - platform: template
-    name: Ambient Gating
+    name: Ambient Mode
+    icon: mdi:weather-night
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_state:
+      - lambda: id(stairs).set_ambient(x);
+
+  - platform: template
+    name: Daylight Gating
     icon: mdi:theme-light-dark
     optimistic: true
     restore_mode: RESTORE_DEFAULT_OFF

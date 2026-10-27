@@ -20,6 +20,10 @@ void EffectRegistry::add_incidental(const char *name, const Effect *effect) {
   this->entries_.push_back({name, EffectKind::INCIDENTAL, effect, nullptr});
 }
 
+void EffectRegistry::add_ambient(const char *name, const Effect *effect) {
+  this->entries_.push_back({name, EffectKind::AMBIENT, effect, nullptr});
+}
+
 int EffectRegistry::find(EffectKind kind, const char *name, size_t len) const {
   if (name == nullptr) return -1;
   for (size_t i = 0; i < this->entries_.size(); i++) {
@@ -43,6 +47,7 @@ const EffectRegistry &effects() {
   static EffectRegistry reg = [] {
     EffectRegistry r;
     register_builtin_effects(r);
+    register_ambient_effects(r);
     register_custom_effects(r);
     return r;
   }();

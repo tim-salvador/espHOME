@@ -10,9 +10,9 @@ color, every action has its own effect, and the hold time learns how long your
 household actually takes on the stairs.
 
 All behavior lives in a small C++ engine that compiles and runs on a PC for
-testing (3,100 automated checks), then runs unchanged on an ESP8266 or ESP32.
+testing (3,148 automated checks), then runs unchanged on an ESP8266 or ESP32.
 
-![version](https://img.shields.io/badge/version-3.4.0-blue) ![esphome](https://img.shields.io/badge/ESPHome-%E2%89%A52026.9.0-black) ![boards](https://img.shields.io/badge/boards-ESP8266%20%7C%20ESP32-green)
+![version](https://img.shields.io/badge/version-3.5.0-blue) ![esphome](https://img.shields.io/badge/ESPHome-%E2%89%A52026.9.0-black) ![boards](https://img.shields.io/badge/boards-ESP8266%20%7C%20ESP32-green)
 
 ---
 
@@ -68,8 +68,9 @@ testing (3,100 automated checks), then runs unchanged on an ESP8266 or ESP32.
 - **Sensor fault detection:** a false-triggering or stuck PIR is flagged in Home
   Assistant and can no longer hold the lights on forever.
 - **Ambient mode:** instead of going dark when idle, the stairs can run a slow,
-  dim ambient effect (Glow, Guide, Landing Beacon, Breathe, Tide, Starfield,
-  Candle, Ember Bed). Motion takes over seamlessly and ambient fades back after.
+  dim ambient effect (Glow, Guide, Head-Tails, Landing Beacon, Breathe, Tide,
+  Starfield, Candle, Ember Bed), in the section colors or one custom ambient
+  color. Motion takes over seamlessly and ambient fades back after.
 - **Daylight gating:** optional suppression of activations from any HA lux sensor.
 - **Simulate buttons** to demo or test every action without walking the stairs.
 - **Dual target:** one YAML file builds for ESP8266 or ESP32.
@@ -536,14 +537,17 @@ Examples:
 | Entity | Default | Range | What it does |
 |---|---|---|---|
 | Ambient Mode | off | switch | off = idle is dark; on = idle runs the Ambient Effect |
-| Ambient Effect | Glow | Glow, Guide, Landing Beacon, Breathe, Tide, Starfield, Candle, Ember Bed | the idle look |
+| Ambient Effect | Glow | Glow, Guide, Head-Tails, Landing Beacon, Breathe, Tide, Starfield, Candle, Ember Bed | the idle look |
 | Ambient Level | 30 % | 10 to 60 % | brightness ceiling for ambient, in perceived brightness (see [Ambient mode](#ambient-mode)) |
+| Ambient Color | off | light | off = ambient uses the section colors; on = ambient uses this color everywhere (brightness scales it) |
 
 Examples:
 - A night light that marks the stair edges: Ambient Mode on, Ambient Effect =
   Guide, Ambient Level = 30 %, scheduled from sunset to sunrise (see the
   automation in [Ambient mode](#ambient-mode)).
 - A gentle glow on the landing only: Ambient Effect = Landing Beacon.
+- Just the top and bottom step as a dim amber marker: Ambient Effect =
+  Head-Tails, Ambient Color on and set to amber.
 
 ### Timing and behavior
 
@@ -811,7 +815,7 @@ make          # build with -Wall -Wextra -Wconversion -Werror and run all checks
 make show     # also print ASCII frames of every effect
 ```
 
-3,100 checks cover: up and down trips, the slow climber, the incidental path,
+3,148 checks cover: up and down trips, the slow climber, the incidental path,
 learned hold, grace restore, boot settle, daylight gating, PIR chatter, two
 people, crossing traffic, the false-trigger pattern from a real field log,
 stuck sensors, faulted sensors still waking dark stairs, color preview,
@@ -823,13 +827,14 @@ seamless start, and an exact final frame. Ambient effects are checked for
 bounds, visibility, seamless looping at the period wrap, and smooth frame to
 frame motion; ambient mode for fade in and out, seamless takeover by motion,
 return after exit, live level and effect changes, preview, simulation, and
-daylight gating.
+daylight gating; the Head-Tails pattern; and the ambient color override,
+including the takeover crossfade and the color blend math.
 
 Validation status of this release:
 
 | Check | Status |
 |---|---|
-| Host tests | 3,100 / 3,100 pass |
+| Host tests | 3,148 / 3,148 pass |
 | `esphome config` (ESP8266 and ESP32, storage on and off) | valid on 2026.9.1 |
 | Glue code against ESPHome 2026.9.1 headers | compiles (syntax check) |
 | Full firmware compile | run `esphome compile` locally |
@@ -1079,6 +1084,7 @@ stateDiagram-v2
 |---|---|---|
 | Glow | a steady, even night light | static |
 | Guide | only the first and last step of each section glow, marking the edges | static |
+| Head-Tails | only the very first and very last step of the whole staircase glow; nothing in between | static |
 | Landing Beacon | only the middle section glows (the landing here); with one or two sections, everything glows | static |
 | Breathe | a very slow rise and fall, never fully dark | 7 s per breath |
 | Tide | a soft swell drifts from the bottom to the top and back | 16 s round trip |
@@ -1088,6 +1094,18 @@ stateDiagram-v2
 
 The random effects repeat exactly every 10 minutes, so they loop without a seam.
 They use a fixed seed, so the pattern is the same every night.
+
+### Ambient color
+
+Ambient normally uses each section's color. Turn on the **Ambient Color** light
+to use one color for ambient everywhere instead; turn it off to go back to the
+section colors. Its color wheel sets the color and its brightness scales it
+(Ambient Level still sets the overall ceiling).
+
+When motion takes over, the color crossfades from the ambient color to the
+section colors over 0.4 s, so the steps still glowing at ambient level do not
+jump in hue. Back at idle, ambient fades in already in the ambient color. A
+section that is turned off stays dark in ambient too.
 
 ### Ambient Level and brightness
 
@@ -1157,6 +1175,17 @@ Product direction for this design:
 ---
 
 ## Changelog
+
+### v3.5.0
+- New ambient effect **Head-Tails**: only the very first and last step of the
+  staircase glow.
+- **Ambient Color** light: when on, ambient uses one custom color everywhere;
+  when off, the section colors. Crossfades to the section colors in 0.4 s when
+  motion takes over.
+- 3,148 host checks.
+- Files changed: `components/stair_engine/` (`stair_effects_ambient.cpp`,
+  `stair_director.h/.cpp`, `stair_compose.h`, `stair_engine.h/.cpp`),
+  `stairwell-lighting.yaml`, README.
 
 ### v3.4.0
 - **Ambient mode:** idle can run a slow, dim effect instead of going dark. New

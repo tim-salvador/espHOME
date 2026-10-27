@@ -61,6 +61,26 @@ class Guide final : public Effect {
   }
 };
 
+// Head-Tails: only the very first and very last step of the whole staircase
+// glow. Unlike Guide, nothing in between (no landing or flight edges).
+class HeadTails final : public Effect {
+ public:
+  const char *name() const override { return "Head-Tails"; }
+  uint32_t duration(const EffectCtx &) const override { return 0; }
+  uint32_t period() const override { return 1000; }
+  void render(const EffectCtx &c, float *out) const override {
+    const uint16_t last = static_cast<uint16_t>(c.geo->num_steps() - 1);
+    for (uint16_t px = 0; px < n_px(c); px++) {
+      if (!c.geo->mapped(px)) {
+        out[px] = 0.0f;
+        continue;
+      }
+      const uint16_t st = c.geo->step(px);
+      out[px] = (st == 0 || st == last) ? 1.0f : 0.0f;
+    }
+  }
+};
+
 // Landing Beacon: only the middle section(s) glow (the landing on this install).
 // With one or two sections, everything glows.
 class LandingBeacon final : public Effect {
@@ -183,6 +203,7 @@ class EmberBed final : public Effect {
 
 const Glow GLOW;
 const Guide GUIDE;
+const HeadTails HEAD_TAILS;
 const LandingBeacon BEACON;
 const Breathe BREATHE;
 const Tide TIDE;
@@ -196,6 +217,7 @@ void register_ambient_effects(EffectRegistry &reg) {
   // The first AMBIENT entry is the default.
   reg.add_ambient("Glow", &GLOW);
   reg.add_ambient("Guide", &GUIDE);
+  reg.add_ambient("Head-Tails", &HEAD_TAILS);
   reg.add_ambient("Landing Beacon", &BEACON);
   reg.add_ambient("Breathe", &BREATHE);
   reg.add_ambient("Tide", &TIDE);

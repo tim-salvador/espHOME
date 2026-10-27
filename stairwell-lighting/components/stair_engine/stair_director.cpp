@@ -420,7 +420,12 @@ void Director::tick(uint32_t now) {
     this->ticked_ = true;
     if (this->phase_ != Phase::IDLE) {
       this->ambient_env_ = 0.0f;
+      const float cstep = this->s_.ambient_color_fade_ms > 0
+                              ? static_cast<float>(dt) / static_cast<float>(this->s_.ambient_color_fade_ms)
+                              : 1.0f;
+      this->ambient_mix_ = this->ambient_mix_ - cstep < 0.0f ? 0.0f : this->ambient_mix_ - cstep;
     } else {
+      this->ambient_mix_ = 1.0f;
       const float step = this->s_.ambient_fade_ms > 0
                              ? static_cast<float>(dt) / static_cast<float>(this->s_.ambient_fade_ms)
                              : 1.0f;

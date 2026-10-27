@@ -38,4 +38,34 @@ inline void compose(const Geometry &geo, const float *levels, const SectionLook 
   }
 }
 
+// Like compose(), but each section's color is blended toward `alt` by `mix`
+// (0 = section colors, 1 = alt everywhere). Used for the ambient color override:
+// colors (including brightness) are mixed first, then scaled by the level, so a
+// takeover crossfades hue without changing brightness. A disabled section stays
+// dark either way.
+inline void compose_mixed(const Geometry &geo, const float *levels, const SectionLook *looks,
+                          const SectionLook &alt, float mix, float master, uint8_t *rgb_out) {
+  if (mix <= 0.0f) {
+    compose(geo, levels, looks, master, rgb_out);
+    return;
+  }
+  const float m = mix > 1.0f ? 1.0f : mix;
+  for (uint16_t px = 0; px < geo.num_pixels(); px++) {
+    const uint8_t s = geo.section_of(px);
+    uint8_t *o = rgb_out + 3 * px;
+    if (s == NO_SECTION || !looks[s].enabled) {
+      o[0] = o[1] = o[2] = 0;
+      continue;
+    }
+    const SectionLook &a = looks[s];
+    const float k = levels[px] * master;
+    const float r = (a.r * a.brightness) * (1.0f - m) + (alt.r * alt.brightness) * m;
+    const float g = (a.g * a.brightness) * (1.0f - m) + (alt.g * alt.brightness) * m;
+    const float b = (a.b * a.brightness) * (1.0f - m) + (alt.b * alt.brightness) * m;
+    o[0] = to_u8(r * k);
+    o[1] = to_u8(g * k);
+    o[2] = to_u8(b * k);
+  }
+}
+
 }  // namespace stair

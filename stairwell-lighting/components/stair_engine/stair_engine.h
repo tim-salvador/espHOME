@@ -56,6 +56,15 @@ class StairEngine : public Component {
   void set_ambient_effect(const char *name, size_t len) { this->select_(stair::Director::Slot::AMBIENT, name, len); }
   void set_ambient(bool on) { this->dir_.settings().ambient = on; }
   void set_ambient_level_pct(float pct) { this->dir_.settings().ambient_level = clamp_(pct / 100.0f, 0.0f, 1.0f); }
+  // Ambient color override from a virtual RGB light: on = ambient uses this
+  // color everywhere; off = ambient uses the section colors.
+  void set_ambient_color(float r, float g, float b, float brightness, bool on) {
+    this->ambient_look_.r = r;
+    this->ambient_look_.g = g;
+    this->ambient_look_.b = b;
+    this->ambient_look_.brightness = brightness;
+    this->ambient_color_on_ = on;
+  }
   // Relay override for one section; "Follow Action" clears it.
   void set_section_effect(uint8_t section, const char *name, size_t len);
   void set_speed_pct(float pct) { this->dir_.settings().speed = clamp_(pct / 100.0f, 0.25f, 4.0f); }
@@ -102,6 +111,8 @@ class StairEngine : public Component {
   stair::Director dir_;
   stair::SectionLook looks_[stair::MAX_SECTIONS];
   float master_{1.0f};
+  stair::SectionLook ambient_look_;
+  bool ambient_color_on_{false};
 
   std::vector<float> levels_;
   std::vector<uint8_t> rgb_;

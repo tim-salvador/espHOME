@@ -573,7 +573,7 @@ static void t_ambient_effects() {
     }
     CHECK(jump < 0.25f, "%s: smooth between frames (worst %.3f)", e.name, jump);
   }
-  CHECK(count == 8, "8 ambient effects (%d)", count);
+  CHECK(count == 9, "9 ambient effects (%d)", count);
 }
 
 static void t_ambient_mode() {
@@ -651,6 +651,55 @@ static void t_ambient_mode() {
   CHECK(r.d.phase() == Phase::IDLE, "gated arrival ignored; ambient continues");
 }
 
+static void t_head_tails_and_color() {
+  printf("Head-Tails pattern, ambient color override and crossfade\n");
+  Rig r;
+  r.d.settings().ambient = true;
+  CHECK(r.d.select_effect(Director::Slot::AMBIENT, "Head-Tails", 10), "select Head-Tails");
+  r.advance(2200);
+  // Step 0 = px 0-1, step 14 = px 56-57. Lower flight's last step (px 14-15) and the landing stay dark.
+  CHECK(r.lv[0] > 0.29f && r.lv[1] > 0.29f && r.lv[56] > 0.29f && r.lv[57] > 0.29f, "first and last step lit");
+  CHECK(r.lv[2] == 0.0f && r.lv[15] == 0.0f && r.lv[16] == 0.0f && r.lv[30] == 0.0f && r.lv[55] == 0.0f,
+        "everything between is dark (no section edges)");
+
+  // Color mix: 1 while idle, eases to 0 over 400 ms once motion takes over, 1 again back at idle.
+  CHECK(r.d.ambient_color_mix() == 1.0f, "mix 1 at idle");
+  r.sensor(End::LOWER, true);
+  r.advance(200);
+  CHECK(r.d.ambient_color_mix() > 0.35f && r.d.ambient_color_mix() < 0.65f, "mid crossfade at 200 ms (%.2f)",
+        r.d.ambient_color_mix());
+  r.advance(300);
+  CHECK(r.d.ambient_color_mix() == 0.0f, "section colors after 400 ms");
+  r.advance(1500);
+  r.sensor(End::LOWER, false);
+  r.advance(3000);
+  r.sensor(End::UPPER, true);
+  r.advance(1000);
+  r.sensor(End::UPPER, false);
+  r.run_until_phase(Phase::IDLE, 10000);
+  r.advance(20);
+  CHECK(r.d.ambient_color_mix() == 1.0f, "mix back to 1 at idle");
+
+  // Compositor blend.
+  Geometry g = make_geo();
+  std::vector<float> lv(g.num_pixels(), 0.5f);
+  SectionLook looks[3];
+  looks[0] = {1.0f, 0.0f, 0.0f, 1.0f, true};   // red
+  looks[1] = {0.0f, 1.0f, 0.0f, 1.0f, true};   // green
+  looks[2] = {0.0f, 0.0f, 1.0f, 1.0f, false};  // disabled
+  SectionLook amber{1.0f, 0.5f, 0.0f, 1.0f, true};
+  std::vector<uint8_t> a(g.num_pixels() * 3), b(g.num_pixels() * 3);
+  compose(g, lv.data(), looks, 1.0f, a.data());
+  compose_mixed(g, lv.data(), looks, amber, 0.0f, 1.0f, b.data());
+  CHECK(a == b, "mix 0 identical to compose");
+  compose_mixed(g, lv.data(), looks, amber, 1.0f, 1.0f, b.data());
+  CHECK(b[0] == 128 && b[1] == 64 && b[2] == 0, "mix 1: amber at level 0.5 (%u,%u,%u)", b[0], b[1], b[2]);
+  CHECK(b[3 * 30] == 128 && b[3 * 30 + 1] == 64, "mix 1: amber on the landing too");
+  CHECK(b[3 * 55] == 0 && b[3 * 55 + 1] == 0 && b[3 * 55 + 2] == 0, "disabled section stays dark");
+  compose_mixed(g, lv.data(), looks, amber, 0.5f, 1.0f, b.data());
+  CHECK(b[0] == 128 && b[1] == 32, "mix 0.5 blends red toward amber (%u,%u)", b[0], b[1]);
+}
+
 static void t_registry() {
   printf("registry and name-based selection\n");
   const EffectRegistry &reg = effects();
@@ -667,7 +716,8 @@ static void t_registry() {
   for (const char *nm : yaml_incidental)
     CHECK(reg.find(EffectKind::INCIDENTAL, nm) >= 0, "YAML option %s registered", nm);
   CHECK(reg.find(EffectKind::TRAVERSAL, "Peek") < 0, "kinds are separate");
-  const char *yaml_ambient[] = {"Glow", "Guide", "Landing Beacon", "Breathe", "Tide", "Starfield", "Candle", "Ember Bed"};
+  const char *yaml_ambient[] = {"Glow",      "Guide",  "Head-Tails", "Landing Beacon", "Breathe",
+                                "Tide",      "Starfield", "Candle", "Ember Bed"};
   for (const char *nm : yaml_ambient) CHECK(reg.find(EffectKind::AMBIENT, nm) >= 0, "YAML option %s registered", nm);
   CHECK(strcmp(reg.at(reg.first(EffectKind::AMBIENT)).name, "Glow") == 0, "default ambient is Glow");
   CHECK(reg.find(EffectKind::AMBIENT, "Cascade") < 0, "ambient kind separate");
@@ -841,6 +891,7 @@ int main(int argc, char **argv) {
   t_registry();
   t_ambient_effects();
   t_ambient_mode();
+  t_head_tails_and_color();
   t_relay();
   t_up_traversal();
   t_down_traversal();

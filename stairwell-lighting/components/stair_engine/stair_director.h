@@ -58,6 +58,7 @@ struct Settings {
   int16_t fx_ambient{-1};
   float ambient_level{0.30f};       // ceiling, pre-gamma (0.30 is about 3% real output at gamma 2.8)
   uint32_t ambient_fade_ms{2000};   // fade into / out of ambient
+  uint32_t ambient_color_fade_ms{400};  // custom ambient color -> section colors on takeover
   // Per-section traversal override for relays; -1 = follow the action's effect.
   int16_t section_fx[MAX_SECTIONS]{-1, -1, -1, -1, -1, -1, -1, -1};
   // Preview
@@ -112,6 +113,9 @@ class Director {
                                                                                            : phase_name(this->phase_);
   }
   float ambient_envelope() const { return this->ambient_env_; }
+  // Weight of the ambient color override: 1 while idle, easing to 0 over
+  // ambient_color_fade_ms after the stairs leave idle (color crossfade on takeover).
+  float ambient_color_mix() const { return this->ambient_mix_; }
   const char *last_event() const { return this->event_; }
   uint32_t event_seq() const { return this->event_seq_; }
   uint8_t pending(Dir d) const { return this->q_[qi(d)].n; }
@@ -225,6 +229,7 @@ class Director {
   uint32_t preview_until_{0};
 
   float ambient_env_{0.0f};
+  float ambient_mix_{0.0f};
   uint32_t ambient_t0_{0};
   uint32_t last_tick_{0};
   bool ticked_{false};

@@ -87,7 +87,9 @@ void StairEngine::render(light::AddressableLight &it) {
   }
 
   this->dir_.render(now, this->levels_.data());
-  stair::compose(this->geo_, this->levels_.data(), this->looks_, this->master_, this->rgb_.data());
+  const float mix = this->ambient_color_on_ ? this->dir_.ambient_color_mix() : 0.0f;
+  stair::compose_mixed(this->geo_, this->levels_.data(), this->looks_, this->ambient_look_, mix, this->master_,
+                       this->rgb_.data());
 
   const int32_t n = static_cast<int32_t>(this->geo_.num_pixels());
   for (int32_t i = 0; i < size; i++) {

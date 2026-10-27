@@ -1,5 +1,5 @@
 # ==============================================================================
-# Stairwell Lighting v3.4.0 (stair_engine): dual-target ESP8266 / ESP32
+# Stairwell Lighting v3.5.0 (stair_engine): dual-target ESP8266 / ESP32
 #
 #   board:             esp8266 (NodeMCU v1.0 / ESP-12E, the installed unit) | esp32
 #   storage_installed: false until the storage-room PIR + white strip are wired
@@ -307,6 +307,30 @@ light:
           const auto &v = id(color_upper).remote_values;
           id(stairs).set_section_color(2, v.get_red(), v.get_green(), v.get_blue(), v.get_brightness(), v.is_on());
 
+  # Ambient color override (virtual). ON = ambient uses this color everywhere;
+  # OFF = ambient uses the section colors. Brightness scales the ambient color.
+  # When motion takes over, the color crossfades to the section colors in 0.4 s.
+  - platform: rgb
+    id: color_ambient
+    name: Ambient Color
+    icon: mdi:palette-swatch
+    red: v_ambient_r
+    green: v_ambient_g
+    blue: v_ambient_b
+    restore_mode: RESTORE_DEFAULT_OFF
+    default_transition_length: 0s
+    gamma_correct: 1.0
+    initial_state:
+      state: false
+      brightness: 100%
+      red: 100%
+      green: 55%
+      blue: 15%
+    on_state:
+      - lambda: |-
+          const auto &v = id(color_ambient).remote_values;
+          id(stairs).set_ambient_color(v.get_red(), v.get_green(), v.get_blue(), v.get_brightness(), v.is_on());
+
 # Sinks for the virtual color pickers (the engine reads the light state directly).
 output:
   - { platform: template, id: v_lower_r,   type: float, write_action: [lambda: (void) state;] }
@@ -318,6 +342,9 @@ output:
   - { platform: template, id: v_upper_r,   type: float, write_action: [lambda: (void) state;] }
   - { platform: template, id: v_upper_g,   type: float, write_action: [lambda: (void) state;] }
   - { platform: template, id: v_upper_b,   type: float, write_action: [lambda: (void) state;] }
+  - { platform: template, id: v_ambient_r, type: float, write_action: [lambda: (void) state;] }
+  - { platform: template, id: v_ambient_g, type: float, write_action: [lambda: (void) state;] }
+  - { platform: template, id: v_ambient_b, type: float, write_action: [lambda: (void) state;] }
 
 # ------------------------------------------------------------------------------
 # Sensors
@@ -465,7 +492,7 @@ select:
   - platform: template
     name: Ambient Effect
     icon: mdi:weather-night
-    options: [Glow, Guide, Landing Beacon, Breathe, Tide, Starfield, Candle, Ember Bed]
+    options: [Glow, Guide, Head-Tails, Landing Beacon, Breathe, Tide, Starfield, Candle, Ember Bed]
     initial_option: Glow
     optimistic: true
     restore_value: true
